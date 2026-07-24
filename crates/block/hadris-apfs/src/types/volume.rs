@@ -7,6 +7,9 @@ use crate::types::{le_u32, le_u64, take};
 pub const VOLUME_MAGIC: [u8; 4] = *b"APSB";
 /// Length of the APFS volume name field.
 pub const VOLUME_NAME_LENGTH: usize = 256;
+/// Volume flag (`APFS_FS_UNENCRYPTED`): the volume's filesystem tree is
+/// stored unencrypted.
+pub const VOLUME_FLAG_UNENCRYPTED: u64 = 0x0000_0001;
 
 /// Parsed APFS volume superblock (`apfs_superblock_t`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +48,21 @@ pub struct VolumeSuperblock {
     pub flags: u64,
     /// Null-terminated UTF-8 volume name bytes.
     pub volume_name: [u8; VOLUME_NAME_LENGTH],
+    /// Transaction identifier of the snapshot this volume roots from, or 0
+    /// to root normally from the volume's own live state
+    /// (`apfs_root_to_xid`).
+    ///
+    /// Set on sealed system volumes (and other volumes mounted from a
+    /// specific snapshot instead of their live state): the volume
+    /// superblock's own `object.transaction_identifier` keeps advancing as
+    /// the container is written to, but the *filesystem tree actually
+    /// presented to users* is frozen at this transaction. Resolving
+    /// virtual object-map lookups against the live transaction id instead
+    /// of this one walks blocks the live filesystem has since freed and
+    /// reused, surfacing as spurious checksum mismatches on an otherwise
+    /// perfectly healthy, unencrypted, and even read-only volume. See
+    /// [`Self::default_read_transaction_id`].
+    pub root_to_xid: u64,
 }
 
 impl VolumeSuperblock {
@@ -81,7 +99,23 @@ impl VolumeSuperblock {
             volume_id: take(data, 240)?,
             flags: le_u64(data, 264)?,
             volume_name: take(data, 704)?,
+            root_to_xid: le_u64(data, 968)?,
         })
+    }
+
+    /// Returns whether the volume's filesystem tree is encrypted on disk.
+    ///
+    /// When true, the volume superblock and object map are still readable
+    /// (APFS keeps container-level metadata in plaintext), but the
+    /// filesystem B-tree blocks the object map points at are AES-XTS
+    /// ciphertext: reading them raw yields bytes whose stored checksum
+    /// field cannot verify, surfacing as a deterministic
+    /// [`crate::ApfsError::ChecksumMismatch`]. Decrypting them requires
+    /// unwrapping the volume encryption key from the container keybag,
+    /// which this crate does not implement. Note that Apple Silicon and T2
+    /// Macs encrypt the Data volume even when FileVault is disabled.
+    pub const fn is_encrypted(&self) -> bool {
+        self.flags & VOLUME_FLAG_UNENCRYPTED == 0
     }
 
     /// Returns the volume name as UTF-8 up to the first NUL byte.
@@ -93,5 +127,19 @@ impl VolumeSuperblock {
             .unwrap_or(VOLUME_NAME_LENGTH);
         core::str::from_utf8(&self.volume_name[..len])
             .map_err(|_| crate::ApfsError::InvalidValue("volume name UTF-8"))
+    }
+
+    /// Returns the transaction identifier B-tree walks rooted at this
+    /// volume should default to bounding lookups by.
+    ///
+    /// This is [`Self::root_to_xid`] when non-zero (the volume is mounted
+    /// from a frozen snapshot, as with a sealed system volume), otherwise
+    /// the volume superblock's own live transaction identifier.
+    pub const fn default_read_transaction_id(&self) -> u64 {
+        if self.root_to_xid != 0 {
+            self.root_to_xid
+        } else {
+            self.object.transaction_identifier
+        }
     }
 }

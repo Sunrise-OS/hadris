@@ -10,6 +10,29 @@ pub const FS_TYPE_INODE: u8 = 3;
 pub const FS_TYPE_FILE_EXTENT: u8 = 8;
 /// Filesystem record type for directory entries.
 pub const FS_TYPE_DIRECTORY_RECORD: u8 = 9;
+/// Filesystem record type for snapshot metadata records
+/// (`j_snap_metadata_key_t`/`j_snap_metadata_val_t`).
+///
+/// Unlike other filesystem records, [`FileSystemKey::id`] for this record
+/// type holds the snapshot's transaction identifier rather than an
+/// inode/object identifier.
+pub const FS_TYPE_SNAP_METADATA: u8 = 1;
+
+/// Volume incompatible-feature bit: directory entry keys are case-insensitive
+/// and use the hashed key layout (`j_drec_hashed_key_t`).
+pub const APFS_INCOMPAT_CASE_INSENSITIVE: u64 = 0x0000_0001;
+/// Volume incompatible-feature bit: directory entry keys are
+/// normalization-insensitive and use the hashed key layout.
+pub const APFS_INCOMPAT_NORMALIZATION_INSENSITIVE: u64 = 0x0000_0008;
+
+/// Returns whether a volume's directory entry keys use the hashed
+/// (`j_drec_hashed_key_t`) layout rather than the plain (`j_drec_key_t`)
+/// layout, based on its incompatible-feature flags.
+pub const fn uses_hashed_directory_keys(incompatible_features: u64) -> bool {
+    incompatible_features
+        & (APFS_INCOMPAT_CASE_INSENSITIVE | APFS_INCOMPAT_NORMALIZATION_INSENSITIVE)
+        != 0
+}
 
 /// Common filesystem-tree key header (`j_key_t`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,15 +69,25 @@ pub struct DirectoryEntryRecord<'a> {
 
 impl<'a> DirectoryEntryRecord<'a> {
     /// Parses a directory entry key/value pair.
-    pub fn parse(key: &'a [u8], value: &'a [u8]) -> crate::Result<Self> {
+    ///
+    /// `hashed` selects the on-disk key layout: `true` for
+    /// `j_drec_hashed_key_t` (case-insensitive/normalization-insensitive
+    /// volumes), `false` for the plain `j_drec_key_t` (case-sensitive
+    /// volumes). See [`uses_hashed_directory_keys`].
+    pub fn parse(key: &'a [u8], value: &'a [u8], hashed: bool) -> crate::Result<Self> {
         let header = FileSystemKey::parse(key)?;
         if header.record_type != FS_TYPE_DIRECTORY_RECORD {
             return Err(crate::ApfsError::InvalidValue("directory record key type"));
         }
-        let name_len_and_hash = u32::from_le_bytes(crate::types::take(key, 8)?);
-        let name_len = (name_len_and_hash & 0x3ff) as usize;
+        let (name_len, name_start) = if hashed {
+            let name_len_and_hash = u32::from_le_bytes(crate::types::take(key, 8)?);
+            ((name_len_and_hash & 0x3ff) as usize, 12)
+        } else {
+            let name_len = u16::from_le_bytes(crate::types::take(key, 8)?) as usize;
+            (name_len, 10)
+        };
         let name_bytes = key
-            .get(12..12 + name_len)
+            .get(name_start..name_start + name_len)
             .ok_or(crate::ApfsError::InputTooSmall)?;
         let name_bytes = name_bytes.strip_suffix(&[0]).unwrap_or(name_bytes);
         Ok(Self {
@@ -84,8 +117,8 @@ pub struct OwnedDirectoryEntryRecord {
 #[cfg(any(feature = "alloc", feature = "std"))]
 impl OwnedDirectoryEntryRecord {
     /// Parses a directory entry key/value pair into an owned record.
-    pub fn parse(key: &[u8], value: &[u8]) -> crate::Result<Self> {
-        let entry = DirectoryEntryRecord::parse(key, value)?;
+    pub fn parse(key: &[u8], value: &[u8], hashed: bool) -> crate::Result<Self> {
+        let entry = DirectoryEntryRecord::parse(key, value, hashed)?;
         Ok(Self {
             parent_id: entry.parent_id,
             file_id: entry.file_id,
@@ -212,15 +245,85 @@ impl FileExtentRecord {
     }
 }
 
+#[cfg(any(feature = "alloc", feature = "std"))]
+/// Fixed-size prefix of `j_snap_metadata_val_t` before the variable-length name.
+const SNAP_METADATA_FIXED_VALUE_SIZE: usize = 50;
+
+/// Parsed snapshot metadata record (`j_snap_metadata_key_t`/`j_snap_metadata_val_t`).
+#[cfg(any(feature = "alloc", feature = "std"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotMetadataRecord {
+    /// Transaction identifier of the snapshot, taken from the record key.
+    pub transaction_id: u64,
+    /// Object identifier of the snapshot's extent-reference tree.
+    pub extent_reference_tree_oid: u64,
+    /// Object identifier of the volume superblock captured by this snapshot.
+    pub superblock_oid: u64,
+    /// Snapshot creation time as nanoseconds since the Unix epoch.
+    pub create_time_ns: u64,
+    /// Snapshot last-change time as nanoseconds since the Unix epoch.
+    pub change_time_ns: u64,
+    /// Reserved inode number field.
+    pub inode_number: u64,
+    /// Raw APFS object type used by the extent-reference tree.
+    pub extent_reference_tree_type: u32,
+    /// Snapshot flags.
+    pub flags: u32,
+    /// Snapshot name.
+    pub name: alloc::string::String,
+}
+
+#[cfg(any(feature = "alloc", feature = "std"))]
+impl SnapshotMetadataRecord {
+    /// Parses a snapshot metadata key/value pair.
+    pub fn parse(key: &[u8], value: &[u8]) -> crate::Result<Self> {
+        let header = FileSystemKey::parse(key)?;
+        if header.record_type != FS_TYPE_SNAP_METADATA {
+            return Err(crate::ApfsError::InvalidValue("snapshot metadata key type"));
+        }
+        let name_len = u16::from_le_bytes(crate::types::take(value, 48)?) as usize;
+        let name_start = SNAP_METADATA_FIXED_VALUE_SIZE;
+        let name_bytes = value
+            .get(name_start..name_start + name_len)
+            .ok_or(crate::ApfsError::InputTooSmall)?;
+        let name_bytes = name_bytes.strip_suffix(&[0]).unwrap_or(name_bytes);
+        Ok(Self {
+            transaction_id: header.id,
+            extent_reference_tree_oid: le_u64(value, 0)?,
+            superblock_oid: le_u64(value, 8)?,
+            create_time_ns: le_u64(value, 16)?,
+            change_time_ns: le_u64(value, 24)?,
+            inode_number: le_u64(value, 32)?,
+            extent_reference_tree_type: u32::from_le_bytes(crate::types::take(value, 40)?),
+            flags: u32::from_le_bytes(crate::types::take(value, 44)?),
+            name: core::str::from_utf8(name_bytes)
+                .map_err(|_| crate::ApfsError::InvalidValue("snapshot name UTF-8"))?
+                .into(),
+        })
+    }
+}
+
+/// Parses owned snapshot metadata records from filesystem-tree leaf entries.
+#[cfg(any(feature = "alloc", feature = "std"))]
+pub fn parse_snapshot_metadata_records(
+    entries: impl IntoIterator<Item = crate::types::OwnedEntry>,
+) -> alloc::vec::Vec<SnapshotMetadataRecord> {
+    entries
+        .into_iter()
+        .filter_map(|entry| SnapshotMetadataRecord::parse(&entry.key, &entry.value).ok())
+        .collect()
+}
+
 /// Parses directory entries from filesystem-tree leaf entries.
 #[cfg(any(feature = "alloc", feature = "std"))]
 pub fn parse_directory_entries<'a>(
     entries: impl IntoIterator<Item = crate::types::FixedEntry<'a>>,
     parent_id: u64,
+    hashed: bool,
 ) -> alloc::vec::Vec<DirectoryEntryRecord<'a>> {
     entries
         .into_iter()
-        .filter_map(|entry| DirectoryEntryRecord::parse(entry.key, entry.value).ok())
+        .filter_map(|entry| DirectoryEntryRecord::parse(entry.key, entry.value, hashed).ok())
         .filter(|entry| entry.parent_id == parent_id)
         .collect()
 }
@@ -230,10 +333,11 @@ pub fn parse_directory_entries<'a>(
 pub fn parse_owned_directory_entries(
     entries: impl IntoIterator<Item = crate::types::OwnedEntry>,
     parent_id: u64,
+    hashed: bool,
 ) -> alloc::vec::Vec<OwnedDirectoryEntryRecord> {
     entries
         .into_iter()
-        .filter_map(|entry| OwnedDirectoryEntryRecord::parse(&entry.key, &entry.value).ok())
+        .filter_map(|entry| OwnedDirectoryEntryRecord::parse(&entry.key, &entry.value, hashed).ok())
         .filter(|entry| entry.parent_id == parent_id)
         .collect()
 }

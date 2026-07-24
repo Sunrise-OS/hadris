@@ -48,6 +48,16 @@ enum Command {
         /// GPT/MBR partition index to open (defaults to the first APFS GPT partition with --gpt).
         #[arg(long)]
         partition: Option<usize>,
+        /// Read the file as it existed in the named snapshot instead of the live volume.
+        #[arg(long)]
+        snapshot: Option<String>,
+        /// Password (or personal recovery key) to unlock an encrypted volume.
+        ///
+        /// Only unlocks software/password-wrapped volumes; Secure-Enclave-
+        /// sealed volumes (every internal volume on T2 and Apple Silicon
+        /// Macs) can't be unlocked this way regardless of password.
+        #[arg(long)]
+        password: Option<String>,
     },
     /// List a directory in a volume.
     Ls {
@@ -65,6 +75,12 @@ enum Command {
         /// GPT/MBR partition index to open (defaults to the first APFS GPT partition with --gpt).
         #[arg(long)]
         partition: Option<usize>,
+        /// List the directory as it existed in the named snapshot instead of the live volume.
+        #[arg(long)]
+        snapshot: Option<String>,
+        /// Password (or personal recovery key) to unlock an encrypted volume.
+        #[arg(long)]
+        password: Option<String>,
     },
     /// Print inode metadata for a path in a volume.
     Stat {
@@ -72,6 +88,26 @@ enum Command {
         path: PathBuf,
         /// File or directory path, relative to the volume root.
         path_in_volume: String,
+        /// Host/device logical sector size.
+        #[arg(long, default_value_t = 512)]
+        sector_size: u32,
+        /// Treat the path as a whole-disk image and auto-select the APFS GPT partition.
+        #[arg(long)]
+        gpt: bool,
+        /// GPT/MBR partition index to open (defaults to the first APFS GPT partition with --gpt).
+        #[arg(long)]
+        partition: Option<usize>,
+        /// Stat the path as it existed in the named snapshot instead of the live volume.
+        #[arg(long)]
+        snapshot: Option<String>,
+        /// Password (or personal recovery key) to unlock an encrypted volume.
+        #[arg(long)]
+        password: Option<String>,
+    },
+    /// List a volume's snapshots.
+    Snapshots {
+        /// Path to an APFS container device or image.
+        path: PathBuf,
         /// Host/device logical sector size.
         #[arg(long, default_value_t = 512)]
         sector_size: u32,
@@ -100,21 +136,178 @@ fn main() -> anyhow::Result<()> {
             sector_size,
             gpt,
             partition,
-        } => cat(path, path_in_volume, sector_size, gpt, partition),
+            snapshot,
+            password,
+        } => cat(
+            path,
+            path_in_volume,
+            sector_size,
+            gpt,
+            partition,
+            snapshot,
+            password,
+        ),
         Command::Ls {
             path,
             path_in_volume,
             sector_size,
             gpt,
             partition,
-        } => ls(path, path_in_volume, sector_size, gpt, partition),
+            snapshot,
+            password,
+        } => ls(
+            path,
+            path_in_volume,
+            sector_size,
+            gpt,
+            partition,
+            snapshot,
+            password,
+        ),
         Command::Stat {
             path,
             path_in_volume,
             sector_size,
             gpt,
             partition,
-        } => stat(path, path_in_volume, sector_size, gpt, partition),
+            snapshot,
+            password,
+        } => stat(
+            path,
+            path_in_volume,
+            sector_size,
+            gpt,
+            partition,
+            snapshot,
+            password,
+        ),
+        Command::Snapshots {
+            path,
+            sector_size,
+            gpt,
+            partition,
+        } => snapshots(path, sector_size, gpt, partition),
+    }
+}
+
+/// Runs an operation against a live container, restarting it from scratch
+/// when it loses a race with concurrent filesystem writes.
+///
+/// Reading a mounted, actively-written APFS container is inherently racy:
+/// between reading a parent object (which records a child's block address)
+/// and reading the child block, the filesystem's copy-on-write machinery can
+/// free and reuse that block, surfacing as a checksum mismatch or a
+/// wrong-object-type error mid-walk. Retrying the same block is useless —
+/// the parent pointer itself is stale — so instead the whole operation is
+/// restarted: the object-map cache is dropped and the operation re-reads the
+/// newest checkpoint superblock, getting a fresh, self-consistent root to
+/// walk from. Each `*_from_container` helper starts with
+/// `latest_superblock()`, so re-invoking it re-anchors the entire walk.
+fn with_live_retries<D, T>(
+    container: &mut Container<D>,
+    mut operation: impl FnMut(&mut Container<D>) -> anyhow::Result<T>,
+) -> anyhow::Result<T>
+where
+    D: hadris_storage::sync::BlockDevice,
+{
+    const ATTEMPTS: usize = 10;
+    let mut last_error = None;
+    for attempt in 0..ATTEMPTS {
+        match operation(container) {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                let retryable = matches!(
+                    error.downcast_ref::<hadris_apfs::ApfsError>(),
+                    Some(
+                        hadris_apfs::ApfsError::ChecksumMismatch { .. }
+                            | hadris_apfs::ApfsError::NotBTreeRoot { .. }
+                    )
+                );
+                if !retryable {
+                    return Err(error);
+                }
+                eprintln!(
+                    "warning: lost a race with live filesystem writes (attempt {}/{ATTEMPTS}): {error}",
+                    attempt + 1
+                );
+                container.invalidate_object_map_cache();
+                last_error = Some(error);
+            }
+        }
+    }
+    Err(last_error
+        .expect("at least one attempt ran")
+        .context(format!(
+            "still racing live filesystem writes after {ATTEMPTS} attempts; \
+         the volume is too busy to read consistently without a snapshot"
+        )))
+}
+
+/// Tries to unlock an encrypted volume with `password`, warning and
+/// returning `true` (skip this volume) when it can't be read at all:
+/// either it's encrypted and no password was given, the password is wrong,
+/// or it's a Secure-Enclave-sealed volume that can never be unlocked this
+/// way regardless of password (every internal volume on T2 and Apple
+/// Silicon Macs, independent of the FileVault toggle).
+///
+/// APFS keeps container-level metadata (volume superblocks, object maps) in
+/// plaintext, but an encrypted volume's filesystem B-tree blocks are AES-XTS
+/// ciphertext — reading them raw without the right key yields a
+/// deterministic checksum mismatch, not corruption.
+fn skip_encrypted<D>(
+    container: &mut Container<D>,
+    volume: &hadris_apfs::types::VolumeSuperblock,
+    password: Option<&str>,
+) -> bool
+where
+    D: hadris_storage::sync::BlockDevice,
+{
+    if !volume.is_encrypted() {
+        return false;
+    }
+    let Some(password) = password else {
+        eprintln!(
+            "warning: skipping volume '{}': it is encrypted on disk; pass --password to attempt \
+             unlocking it (won't work for Secure-Enclave-sealed volumes)",
+            volume.name().unwrap_or("<invalid utf8>")
+        );
+        return true;
+    };
+    match container.unlock_volume(volume, password.as_bytes()) {
+        Ok(()) => false,
+        Err(error) => {
+            eprintln!(
+                "warning: skipping volume '{}': {error}",
+                volume.name().unwrap_or("<invalid utf8>")
+            );
+            true
+        }
+    }
+}
+
+/// Resolves the transaction identifier to read a volume as of: either the
+/// volume's own current transaction identifier, or a named snapshot's.
+fn resolve_max_transaction_id<D>(
+    container: &mut Container<D>,
+    volume: &hadris_apfs::types::VolumeSuperblock,
+    snapshot: Option<&str>,
+) -> anyhow::Result<u64>
+where
+    D: hadris_storage::sync::BlockDevice,
+{
+    match snapshot {
+        Some(name) => {
+            let snapshot = container
+                .find_volume_snapshot(volume, name)?
+                .with_context(|| {
+                    format!(
+                        "snapshot '{name}' not found on volume '{}'",
+                        volume.name().unwrap_or("<invalid utf8>")
+                    )
+                })?;
+            Ok(snapshot.transaction_id)
+        }
+        None => Ok(volume.object.transaction_identifier),
     }
 }
 
@@ -191,6 +384,8 @@ fn cat(
     sector_size: u32,
     gpt: bool,
     partition: Option<usize>,
+    snapshot: Option<String>,
+    password: Option<String>,
 ) -> anyhow::Result<()> {
     let mut file = File::open(&path).with_context(|| format!("opening {}", path.display()))?;
     let len = file.metadata()?.len();
@@ -233,25 +428,55 @@ fn cat(
                 selected.index, selected.start_lba
             )
         })?;
-        cat_from_container(&mut container, &path_in_volume)
+        with_live_retries(&mut container, |container| {
+            cat_from_container(
+                container,
+                &path_in_volume,
+                snapshot.as_deref(),
+                password.as_deref(),
+            )
+        })
     } else {
         let device = SeekBlockDevice::new(file, geometry);
         let mut container = Container::open(device).or_else(|error| {
             bail!("opening APFS container failed: {error}. If this is a full-disk/GPT image, retry with --gpt")
         })?;
-        cat_from_container(&mut container, &path_in_volume)
+        with_live_retries(&mut container, |container| {
+            cat_from_container(
+                container,
+                &path_in_volume,
+                snapshot.as_deref(),
+                password.as_deref(),
+            )
+        })
     }
 }
 
-fn cat_from_container<D>(container: &mut Container<D>, path_in_volume: &str) -> anyhow::Result<()>
+fn cat_from_container<D>(
+    container: &mut Container<D>,
+    path_in_volume: &str,
+    snapshot: Option<&str>,
+    password: Option<&str>,
+) -> anyhow::Result<()>
 where
     D: hadris_storage::sync::BlockDevice,
 {
     let latest = container.latest_superblock()?;
     let volumes = container.volume_superblocks(&latest)?;
     for volume in &volumes {
-        if let Some(entry) = container.resolve_path(volume, path_in_volume)? {
-            let mut bytes = container.read_file(volume, entry.file_id, 1024 * 1024 * 1024)?;
+        if skip_encrypted(container, volume, password) {
+            continue;
+        }
+        let max_transaction_id = resolve_max_transaction_id(container, volume, snapshot)?;
+        if let Some(entry) =
+            container.resolve_path_as_of(volume, path_in_volume, max_transaction_id)?
+        {
+            let mut bytes = container.read_file_as_of(
+                volume,
+                entry.file_id,
+                1024 * 1024 * 1024,
+                max_transaction_id,
+            )?;
             while bytes.last() == Some(&0) {
                 bytes.pop();
             }
@@ -268,6 +493,8 @@ fn ls(
     sector_size: u32,
     gpt: bool,
     partition: Option<usize>,
+    snapshot: Option<String>,
+    password: Option<String>,
 ) -> anyhow::Result<()> {
     let mut file = File::open(&path).with_context(|| format!("opening {}", path.display()))?;
     let len = file.metadata()?.len();
@@ -310,33 +537,58 @@ fn ls(
                 selected.index, selected.start_lba
             )
         })?;
-        ls_from_container(&mut container, &path_in_volume)
+        with_live_retries(&mut container, |container| {
+            ls_from_container(
+                container,
+                &path_in_volume,
+                snapshot.as_deref(),
+                password.as_deref(),
+            )
+        })
     } else {
         let device = SeekBlockDevice::new(file, geometry);
         let mut container = Container::open(device).or_else(|error| {
             bail!("opening APFS container failed: {error}. If this is a full-disk/GPT image, retry with --gpt")
         })?;
-        ls_from_container(&mut container, &path_in_volume)
+        with_live_retries(&mut container, |container| {
+            ls_from_container(
+                container,
+                &path_in_volume,
+                snapshot.as_deref(),
+                password.as_deref(),
+            )
+        })
     }
 }
 
-fn ls_from_container<D>(container: &mut Container<D>, path_in_volume: &str) -> anyhow::Result<()>
+fn ls_from_container<D>(
+    container: &mut Container<D>,
+    path_in_volume: &str,
+    snapshot: Option<&str>,
+    password: Option<&str>,
+) -> anyhow::Result<()>
 where
     D: hadris_storage::sync::BlockDevice,
 {
     let latest = container.latest_superblock()?;
     let volumes = container.volume_superblocks(&latest)?;
     for volume in &volumes {
+        if skip_encrypted(container, volume, password) {
+            continue;
+        }
+        let max_transaction_id = resolve_max_transaction_id(container, volume, snapshot)?;
         let directory_id = if path_in_volume.trim_matches('/').is_empty() {
             hadris_apfs::types::filesystem::INODE_ROOT_DIRECTORY
         } else {
-            match container.resolve_path(volume, path_in_volume)? {
+            match container.resolve_path_as_of(volume, path_in_volume, max_transaction_id)? {
                 Some(entry) => entry.file_id,
                 None => bail!("path not found: {path_in_volume}"),
             }
         };
         println!("{}:", volume.name().unwrap_or("<invalid utf8>"));
-        for entry in container.directory_owned_entries(volume, directory_id)? {
+        for entry in
+            container.directory_owned_entries_as_of(volume, directory_id, max_transaction_id)?
+        {
             println!(
                 "  {} (inode {}, type {})",
                 entry.name,
@@ -354,6 +606,8 @@ fn stat(
     sector_size: u32,
     gpt: bool,
     partition: Option<usize>,
+    snapshot: Option<String>,
+    password: Option<String>,
 ) -> anyhow::Result<()> {
     let mut file = File::open(&path).with_context(|| format!("opening {}", path.display()))?;
     let len = file.metadata()?.len();
@@ -396,39 +650,66 @@ fn stat(
                 selected.index, selected.start_lba
             )
         })?;
-        stat_from_container(&mut container, &path_in_volume)
+        with_live_retries(&mut container, |container| {
+            stat_from_container(
+                container,
+                &path_in_volume,
+                snapshot.as_deref(),
+                password.as_deref(),
+            )
+        })
     } else {
         let device = SeekBlockDevice::new(file, geometry);
         let mut container = Container::open(device).or_else(|error| {
             bail!("opening APFS container failed: {error}. If this is a full-disk/GPT image, retry with --gpt")
         })?;
-        stat_from_container(&mut container, &path_in_volume)
+        with_live_retries(&mut container, |container| {
+            stat_from_container(
+                container,
+                &path_in_volume,
+                snapshot.as_deref(),
+                password.as_deref(),
+            )
+        })
     }
 }
 
-fn stat_from_container<D>(container: &mut Container<D>, path_in_volume: &str) -> anyhow::Result<()>
+fn stat_from_container<D>(
+    container: &mut Container<D>,
+    path_in_volume: &str,
+    snapshot: Option<&str>,
+    password: Option<&str>,
+) -> anyhow::Result<()>
 where
     D: hadris_storage::sync::BlockDevice,
 {
     let latest = container.latest_superblock()?;
     let volumes = container.volume_superblocks(&latest)?;
     for volume in &volumes {
+        if skip_encrypted(container, volume, password) {
+            continue;
+        }
+        let max_transaction_id = resolve_max_transaction_id(container, volume, snapshot)?;
         let inode_id = if path_in_volume.trim_matches('/').is_empty() {
             hadris_apfs::types::filesystem::INODE_ROOT_DIRECTORY
         } else {
-            match container.resolve_path(volume, path_in_volume)? {
+            match container.resolve_path_as_of(volume, path_in_volume, max_transaction_id)? {
                 Some(entry) => entry.file_id,
                 None => continue,
             }
         };
-        let Some(inode) = container.inode_record(volume, inode_id)? else {
+        let Some(inode) = container.inode_record_as_of(volume, inode_id, max_transaction_id)?
+        else {
             continue;
         };
         println!("volume: {}", volume.name().unwrap_or("<invalid utf8>"));
         println!("  inode: {}", inode.id);
         println!("  parent: {}", inode.parent_id);
         println!("  mode: {:#o}", inode.mode);
-        println!("  size: {}", container.file_size(volume, inode_id)?);
+        println!(
+            "  size: {}",
+            container.file_size_as_of(volume, inode_id, max_transaction_id)?
+        );
         println!("  link/child count: {}", inode.link_or_child_count);
         println!("  created: {}", format_apfs_time(inode.create_time_ns));
         println!(
@@ -440,6 +721,88 @@ where
         return Ok(());
     }
     bail!("path not found: {path_in_volume}")
+}
+
+fn snapshots(
+    path: PathBuf,
+    sector_size: u32,
+    gpt: bool,
+    partition: Option<usize>,
+) -> anyhow::Result<()> {
+    let mut file = File::open(&path).with_context(|| format!("opening {}", path.display()))?;
+    let len = file.metadata()?.len();
+    let block_size = BlockSize::new(sector_size).context("sector size must be non-zero")?;
+    let block_count = if len == 0 {
+        u64::MAX / u64::from(sector_size)
+    } else {
+        len / u64::from(sector_size)
+    };
+    let geometry = BlockGeometry::new(block_size, BlockCount(block_count));
+    if gpt || partition.is_some() {
+        let table =
+            PartitionTable::read_from(&mut file, sector_size).context("reading partition table")?;
+        let selected = table
+            .partitions()
+            .into_iter()
+            .find(|part| match (partition, part.partition_type) {
+                (Some(index), _) => part.index == index,
+                (None, PartitionType::Gpt(guid)) => guid == Guid::APPLE_APFS,
+                (None, _) => false,
+            })
+            .context("no matching APFS partition found")?;
+        let offset = selected
+            .start_lba
+            .checked_mul(u64::from(sector_size))
+            .context("partition offset overflow")?;
+        let length = selected
+            .size_sectors
+            .checked_mul(u64::from(sector_size))
+            .context("partition length overflow")?;
+        let view = PartitionView::new(&mut file, offset, length)
+            .map_err(|error| anyhow::anyhow!("creating partition view: {error}"))?;
+        let device = SeekBlockDevice::new(
+            view,
+            BlockGeometry::new(block_size, BlockCount(selected.size_sectors)),
+        );
+        let mut container = Container::open(device).with_context(|| {
+            format!(
+                "opening APFS partition {} at LBA {}",
+                selected.index, selected.start_lba
+            )
+        })?;
+        with_live_retries(&mut container, snapshots_from_container)
+    } else {
+        let device = SeekBlockDevice::new(file, geometry);
+        let mut container = Container::open(device).or_else(|error| {
+            bail!("opening APFS container failed: {error}. If this is a full-disk/GPT image, retry with --gpt")
+        })?;
+        with_live_retries(&mut container, snapshots_from_container)
+    }
+}
+
+fn snapshots_from_container<D>(container: &mut Container<D>) -> anyhow::Result<()>
+where
+    D: hadris_storage::sync::BlockDevice,
+{
+    let latest = container.latest_superblock()?;
+    let volumes = container.volume_superblocks(&latest)?;
+    for volume in &volumes {
+        println!("{}:", volume.name().unwrap_or("<invalid utf8>"));
+        let snapshots = container.volume_snapshots(volume)?;
+        if snapshots.is_empty() {
+            println!("  (no snapshots)");
+            continue;
+        }
+        for snapshot in snapshots {
+            println!(
+                "  {} (xid {}, created {})",
+                snapshot.name,
+                snapshot.transaction_id,
+                format_apfs_time(snapshot.create_time_ns)
+            );
+        }
+    }
+    Ok(())
 }
 
 fn print_container_info<D>(
@@ -483,16 +846,17 @@ where
             Vec::new()
         }
     };
-    let root_tree_locations: Vec<(u64, hadris_apfs::types::ObjectMapValue)> = volume_superblocks
-        .iter()
-        .filter_map(|volume| {
-            container
-                .resolve_volume_object(volume, volume.root_tree_oid)
-                .ok()
-                .flatten()
-                .map(|value| (volume.object.identifier, value))
-        })
-        .collect();
+    let mut root_tree_locations: Vec<(u64, hadris_apfs::types::ObjectMapValue)> = Vec::new();
+    for volume in &volume_superblocks {
+        match container.resolve_volume_object(volume, volume.root_tree_oid) {
+            Ok(Some(value)) => root_tree_locations.push((volume.object.identifier, value)),
+            Ok(None) => {}
+            Err(error) => eprintln!(
+                "warning: root tree resolution failed for '{}': {error}",
+                volume.name().unwrap_or("<invalid utf8>")
+            ),
+        }
+    }
     print_info(
         space_manager.as_ref(),
         chunk_free_sum,

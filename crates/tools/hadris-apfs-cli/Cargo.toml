@@ -18,7 +18,7 @@ path = "src/bin/hadris-apfs.rs"
 doc = false
 
 [dependencies]
-hadris-apfs = { workspace = true, features = ["std", "read", "sync", "tree"] }
+hadris-apfs = { workspace = true, features = ["std", "read", "sync", "tree", "crypto"] }
 hadris-storage = { workspace = true, features = ["std", "sync"] }
 hadris-part = { workspace = true, features = ["std", "read", "sync"] }
 clap.workspace = true

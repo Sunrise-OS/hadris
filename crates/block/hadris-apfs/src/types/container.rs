@@ -54,6 +54,11 @@ pub struct ContainerSuperblock {
     pub reaper_oid: u64,
     /// Volume object identifiers from `nx_fs_oid`.
     pub volume_oids: [u64; CONTAINER_MAX_FILE_SYSTEMS],
+    /// First physical block of the container keybag (`nx_keylocker.pr_start_addr`),
+    /// or 0 if the container has no keybag (never encrypted).
+    pub keybag_block: u64,
+    /// Number of blocks in the container keybag (`nx_keylocker.pr_block_count`).
+    pub keybag_block_count: u64,
 }
 
 impl ContainerSuperblock {
@@ -104,6 +109,8 @@ impl ContainerSuperblock {
             object_map_oid: le_u64(data, 160)?,
             reaper_oid: le_u64(data, 168)?,
             volume_oids,
+            keybag_block: le_u64(data, 1296)?,
+            keybag_block_count: le_u64(data, 1304)?,
         })
     }
 

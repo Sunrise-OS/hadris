@@ -70,6 +70,12 @@ pub struct ObjectMapValue {
     pub address: u64,
 }
 
+/// Object map value flag (`OMAP_VAL_ENCRYPTED`): the block this value points
+/// at is AES-XTS ciphertext (tweaked by its own physical block address) and
+/// must be decrypted with the owning volume's unwrapped encryption key
+/// before its object checksum will verify. See [`crate::crypto`].
+pub const OMAP_VAL_ENCRYPTED: u32 = 0x0000_0004;
+
 impl ObjectMapValue {
     /// Parses an object map value from bytes.
     pub fn parse(data: &[u8]) -> crate::Result<Self> {
@@ -78,5 +84,11 @@ impl ObjectMapValue {
             size: le_u32(data, 4)?,
             address: le_u64(data, 8)?,
         })
+    }
+
+    /// Whether the block this value points at is encrypted; see
+    /// [`OMAP_VAL_ENCRYPTED`].
+    pub const fn is_encrypted(&self) -> bool {
+        self.flags & OMAP_VAL_ENCRYPTED != 0
     }
 }

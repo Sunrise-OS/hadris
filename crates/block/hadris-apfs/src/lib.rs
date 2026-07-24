@@ -14,6 +14,8 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+#[cfg(feature = "crypto")]
+pub mod crypto;
 /// Error types returned by APFS readers and writers.
 pub mod error;
 pub mod types;
