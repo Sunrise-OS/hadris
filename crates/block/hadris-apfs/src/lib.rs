@@ -4,11 +4,11 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![allow(clippy::duplicate_mod)]
 
-//! An experimental, read-only APFS container and volume reader.
+//! An experimental APFS container reader and filesystem driver.
 //!
 //! The API is outside the Hadris 3.x stability promise and may change in a
-//! minor release. Compressed files, hardware/per-file encryption, snapshots and writes are not
-//! supported; see the README for the full scope.
+//! minor release. Compressed files, hardware/per-file encryption and snapshots
+//! are not supported; see the README for the full scope.
 //!
 //! On-disk structures live in [`types`]. The readers in the `sync` and
 //! `async` modules walk them over a `hadris-storage` block device.
@@ -41,6 +41,11 @@
 //! unified asynchronous APIs with local or Send devices. Without `alloc`, the
 //! native container header and block reader remains usable. `encryption`
 //! implies `alloc` and adds optional crypto dependencies.
+//! With `write`, `ApfsFs::mount_writable` and `mount_volume_writable` explicitly
+//! enable experimental mutations of a restricted single-volume, unencrypted
+//! layout. Ordinary mounts remain read-only. Mutations use copy-on-write
+//! metadata and ordered checkpoint publication, retaining old allocations
+//! without reclaiming them. Unsupported layouts are rejected before writes.
 //!
 //! ```rust,no_run
 //! use std::fs::File;
@@ -73,6 +78,9 @@ extern crate std;
 
 #[cfg(all(feature = "encryption", any(feature = "sync", feature = "async")))]
 mod crypto;
+
+#[cfg(all(feature = "write", any(feature = "sync", feature = "async")))]
+mod write;
 
 /// Error types returned by APFS readers and writers.
 pub mod error;

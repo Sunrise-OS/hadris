@@ -1,4 +1,7 @@
 io_transform! {
+#[cfg(feature = "write")]
+#[path = "write/container.rs"]
+mod writer;
 
 
 use crate::read::ContainerInfo;
@@ -28,6 +31,8 @@ pub struct Container<D> {
     device: D,
     info: ContainerInfo,
     device_block_size: u32,
+    #[cfg(feature = "write")]
+    write_in_flight: bool,
     #[cfg(feature = "alloc")]
     zero_error: Option<crate::ApfsError>,
     /// The filesystem trees of the volume queried last, so that keyed
@@ -150,6 +155,8 @@ where
                 #[cfg(not(feature = "alloc"))]
                 let _ = zero_error;
                 Ok(Self { device, info, device_block_size,
+                    #[cfg(feature = "write")]
+                    write_in_flight: false,
                     #[cfg(feature = "alloc")]
                     zero_error,
                     #[cfg(feature = "alloc")]

@@ -3,7 +3,8 @@
 APFS has a container holding volumes. A container is an inspection object; a
 mounted volume is a filesystem. The V3 port keeps those two operations distinct
 and measures the driver through the same `FileSystem` contract as other formats.
-APFS remains an experimental, read-only format.
+APFS remains experimental. Ordinary mounts are read-only; explicit writable
+mounts require the opt-in `write` feature and a restricted supported layout.
 
 Opt-in [software APFS encryption](apfs-encryption.md) is qualified against
 native macOS fixtures; Asahi's hardware unlock path remains a separate milestone.
@@ -31,14 +32,18 @@ device through `MountError`, as the other V3 drivers do.
 
 Mounting selects the current supported checkpoint and volume view. It does not
 merge APFS System and Data volumes into a macOS namespace or implement snapshots,
-hardware/per-file encryption, compression, writes or recovery. Those limitations remain explicit.
+hardware/per-file encryption, compression or recovery. Those limitations remain explicit.
 Software-encrypted single-key volumes use password mount methods independently
 of volume and crypto-user selection.
 
 ## Shared filesystem behavior
 
-A mounted APFS volume reports itself read-only even if its underlying device can
-write. Mutations and writable opens are refused before reaching the device.
+An ordinary APFS mount reports itself read-only even if its underlying device
+can write. Mutations and writable opens are refused before reaching the device.
+With `write`, `mount_writable` and `mount_volume_writable` explicitly enable
+experimental mutations of supported single-volume, unencrypted images.
+See the [write scope](../crates/block/hadris-apfs/README.md#experimental-writes)
+for allocation retention, checkpoint publication and unsupported features.
 Directory listings do not expose `.` or `..`; generic path helpers implement
 those components. Directory cursors advance deterministically, hard links refer
 to the same inode, metadata reflects on-disk types and times, and reads at or past
@@ -65,5 +70,7 @@ Synthetic images exercise the filesystem contract and malformed media, while
 native macOS images retain a separate interoperability check. The runnable APFS
 use-case example demonstrates the public interfaces through checked outcomes.
 Tests cover synchronous and asynchronous behavior, selection, sparse and linked
-files, backend failures and refusal to write. Feature checks, API shape/parity
-checks and targeted Miri runs accompany the port.
+files, backend failures and refusal to write on ordinary mounts. Experimental
+write regressions cover persistence, checkpoint-ring reuse, interrupted/torn
+writes and async cancellation. Feature checks, API shape/parity checks and
+targeted Miri runs accompany the port.

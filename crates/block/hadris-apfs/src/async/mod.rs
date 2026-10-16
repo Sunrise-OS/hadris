@@ -20,7 +20,12 @@ mod fs;
 #[cfg(feature = "alloc")]
 pub use fs::ApfsFs;
 
-#[cfg(feature = "alloc")]
+#[cfg(all(feature = "alloc", not(feature = "write")))]
 hadris_fs::__forward_filesystem! {
     shims ApfsFs<D: storage::BlockDevice> { resolve write }
+}
+
+#[cfg(all(feature = "alloc", feature = "write"))]
+hadris_fs::__forward_filesystem! {
+    shims ApfsFs<D: storage::BlockDevice> { resolve }
 }

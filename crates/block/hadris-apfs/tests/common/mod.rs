@@ -3,6 +3,9 @@
 
 use hadris_apfs::types::checksum::fletcher64;
 
+#[allow(dead_code)]
+pub mod write;
+
 pub const BLOCK: usize = 4096;
 
 /// How the volume's filesystem tree is stored.

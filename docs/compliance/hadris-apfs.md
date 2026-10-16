@@ -1,6 +1,6 @@
 # `hadris-apfs` compliance scope
 
-`hadris-apfs` is a read-only preview outside the 3.x stability promise. No
+`hadris-apfs` is an experimental preview outside the 3.x stability promise. No
 source is pinned in [`spec/sources.json`](../../spec/sources.json) and there
 is no requirement catalog under `spec/requirements/`, so no APFS behavior is
 labeled source-verified, and this is a scope note rather than a conformance
@@ -18,6 +18,10 @@ Evidence is interoperability and robustness evidence, not clause-level
 conformance: images macOS creates through `hdiutil` and `diskutil`,
 including encrypted ones, are read and compared with the native mount,
 crafted images exercise checkpoint fallback, per-node damage and feature
-refusal, and the `apfs_read` fuzz target runs locally. Writing,
-snapshots, Fusion containers, hardware-encrypted volumes and per-file keys
-are out of scope.
+refusal, and the `apfs_read` fuzz target runs locally. Experimental writes are
+opt-in and restricted to the layout documented in the
+[write scope](../../crates/block/hadris-apfs/README.md#experimental-writes).
+Persistence and interrupted-checkpoint tests exercise that subset, and a
+modified `mkapfs` image has been read with independent `apfs-fuse`; this is not
+Apple `fsck_apfs` or native macOS write qualification. Snapshots, Fusion
+containers, hardware-encrypted volumes and per-file keys remain out of scope.

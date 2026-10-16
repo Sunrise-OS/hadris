@@ -14,16 +14,17 @@ use crate::{Clock, CodePage, Cp437, DateTimeError, NoClock};
 ///
 /// | Option | FAT | exFAT | ISO 9660 | UDF | NTFS | APFS |
 /// |---|---|---|---|---|---|---|
-/// | [`read_only`](Self::read_only) | yes | yes | always read-only | always read-only | always read-only | always read-only |
+/// | [`read_only`](Self::read_only) | yes | yes | always read-only | always read-only | always read-only | yes (explicit writable mount) |
 /// | [`with_clock`](Self::with_clock) | yes | yes | no | no | no | no |
 /// | [`with_utc_offset`](Self::with_utc_offset) | yes | yes | no | no | no | no |
 /// | [`with_code_page`](Self::with_code_page) | yes | no | no | no | no | no |
 /// | [`with_node_limit`](Self::with_node_limit) | yes | yes | no | no | no | yes |
 /// | [`backup_boot`](Self::backup_boot) | yes | yes | no | yes | no | no |
 ///
-/// A driver ignores an option it does not honour; it never fails because
-/// of one. `MountOptions` is `Clone` but not `Copy`, so later 3.x releases
-/// can add options that own their values.
+/// An ordinary mount ignores an option its driver does not honour; it never
+/// fails because of one. APFS's explicit experimental writable constructors
+/// reject `read_only` rather than override it. `MountOptions` is `Clone` but not
+/// `Copy`, so later 3.x releases can add options that own their values.
 ///
 /// ```rust
 /// use hadris_fs::{Ascii, MountOptions};
@@ -62,8 +63,9 @@ impl MountOptions {
 
     /// Mounts for reading only: the driver never writes to the device, not
     /// even a dirty flag, and writing methods fail with
-    /// [`ErrorKind::ReadOnly`](crate::ErrorKind::ReadOnly). Only FAT and
-    /// exFAT mount read-write; the other drivers are always read-only.
+    /// [`ErrorKind::ReadOnly`](crate::ErrorKind::ReadOnly). FAT, exFAT and
+    /// APFS's explicit experimental writable constructors support writes;
+    /// ordinary APFS mounts and the other drivers remain read-only.
     pub const fn read_only(mut self) -> Self {
         self.read_only = true;
         self

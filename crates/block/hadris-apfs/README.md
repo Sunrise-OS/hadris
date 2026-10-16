@@ -1,10 +1,11 @@
 # hadris-apfs
 
-`hadris-apfs` is an experimental, read-only reader for APFS containers and
-volumes. It supports synchronous and asynchronous I/O and can be used in
-`no_std` environments with an allocator. Its API is outside the Hadris 3.x
-stability promise and may change in a minor release; depend on it with
-`hadris-apfs = "~3.0"` to take only compatible updates.
+`hadris-apfs` is an experimental APFS container reader and filesystem driver.
+Ordinary mounts are read-only; the opt-in `write` feature adds restricted
+existing-volume mutations. It supports synchronous and asynchronous I/O and
+can be used in `no_std` environments with an allocator. Its API is outside the
+Hadris 3.x stability promise and may change in a minor release; depend on it
+with `hadris-apfs = "~3.0"` to take only compatible updates.
 
 The crate is suitable for inspecting unencrypted APFS images and, with the
 `encryption` feature, password-encrypted single-key APFS volumes made by macOS. It
@@ -91,10 +92,55 @@ generic file access, VFS operations and volume selection shape this API.
 - Symlink targets and hard links.
 - Space manager summaries and chunk-info blocks.
 
+## Experimental writes
+
+Enable `write` (which implies `alloc`) and call `ApfsFs::mount_writable` or
+`mount_volume_writable`. Ordinary and password mount constructors remain
+read-only even when this feature is enabled. Writable constructors require a
+writable device and reject `MountOptions::read_only()`.
+
+The supported layout is deliberately narrow: one unencrypted, case-sensitive
+volume with 4096-byte APFS blocks, plain or normalization-hashed directory
+keys, ordinary files, directories and embedded symlink targets. Images made
+by the out-of-tree XNU `tools/mkapfs` implementation are supported. Existing
+snapshots, clones/shared streams, hard links, sparse files, compression,
+encryption/sealing, Fusion, additional extended attributes, volume roles or
+reserves, and active space-manager internal pools, free queues or allocation
+zones are rejected before writing. This is not a general macOS-volume writer.
+
+Supported mutations are `create`, `mkdir`, `write` (including zero-filled
+growth), `truncate`, `unlink`, `rmdir`, `rename`, and `setattr` for permissions,
+owner and supported timestamps. `fsync`, `sync` and writable unmount flush the
+device. Removing the last name of an open node fails with `Busy`.
+New names must be valid UTF-8 and no longer than 255 bytes.
+
+Each mutation validates the supported on-disk layout, stages metadata in
+memory, copies changed data and rebuilds the filesystem, extent-reference and
+object-map trees on free blocks. Allocation bitmaps and chunk-info blocks
+are copied too. It writes inactive checkpoint-data and descriptor slots,
+flushes the device, publishes a checksummed container superblock, then
+flushes again. The previous checkpoint is untouched until publication.
+An I/O failure or async cancellation after writes begin disables further
+mutations on that mount; reopen the device to select its valid checkpoint.
+Publication errors can mean the new checkpoint reached disk despite the error.
+Do not retry a mutation blindly.
+
+Old allocations are never reclaimed, including blocks made obsolete by
+truncate or unlink. Repeated mutations therefore consume space until
+`NoSpace`; this is an experimental correctness-first implementation, not a
+bounded-memory or sustained-write design. Back up images before using it.
+
+Persistence, rotating checkpoints, interrupted/torn writes and async
+cancellation are covered by regression tests. A modified `mkapfs` image was
+also mounted with the independent `apfs-fuse` reader, checking file bytes and
+Unicode names. Apple `fsck_apfs` and native macOS write interoperability have
+not been qualified.
+
 ## Limitations
 
-- The reader is read-only. Creating, modifying and repairing volumes are not
-  supported.
+- Ordinary mounts are read-only. Creating new containers and repairing
+  volumes are not supported; experimental existing-volume writes require the
+  explicit constructors and supported layout described above.
 - Compressed files (`decmpfs`) are reported as
   `ErrorKind::Unsupported` rather than decoded.
 - Software encryption requires the `encryption` feature and a password mount.

@@ -13,6 +13,16 @@ use hadris_fs::{
     FileType, FsResult, FsStats, Metadata, MountError, MountOptions, Name, NameError, NodeId,
     OpenMode, Owner, Permissions, Stored,
 };
+#[cfg(feature = "write")]
+use hadris_fs::{RenameMode, SetAttr};
+
+#[cfg(feature = "write")]
+#[derive(Debug, Default)]
+struct NodeUse {
+    pins: u64,
+    opens: u64,
+    removed: bool,
+}
 
 fn file_type<E>(inode: &InodeRecord) -> FsResult<FileType, E> {
     match inode.mode & 0o170000 {
@@ -202,7 +212,7 @@ fn extent_sizes<E>(inode: &InodeRecord, extents: &[FileExtentRecord]) -> FsResul
 
 io_transform! {
 
-/// Read-only APFS volume driver implementing the shared filesystem contract.
+/// APFS volume driver implementing the shared filesystem contract.
 ///
 /// Node identifiers are stable APFS inode identifiers. The driver owns one
 /// container and selects one volume from its newest checkpoint. It reads a
@@ -217,6 +227,10 @@ io_transform! {
 /// with the type its directory record holds, and `stat`, `open`, `read` and
 /// `readlink` on the node return the error. Names are exposed as their
 /// on-disk bytes, without UTF-8 validation or a 255-byte limit.
+///
+/// The usual mount constructors remain read-only. With `write`, explicit
+/// writable mounts validate the supported single-volume, unencrypted layout.
+/// Each mutation publishes a durable checkpoint before returning.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct ApfsFs<D> {
@@ -224,6 +238,10 @@ pub struct ApfsFs<D> {
     checkpoint: ContainerSuperblock,
     volume: VolumeSuperblock,
     nodes: Nodes,
+    #[cfg(feature = "write")]
+    writable: bool,
+    #[cfg(feature = "write")]
+    uses: BTreeMap<u64, NodeUse>,
 }
 
 impl<D: BlockDevice> ApfsFs<D> {
@@ -238,7 +256,7 @@ impl<D: BlockDevice> ApfsFs<D> {
     /// Mount failures return the device for inspection or retry.
     #[cfg_attr(feature = "tracing", tracing::instrument(target = "hadris::apfs", level = "trace", skip_all))]
     pub async fn mount(device: D, options: MountOptions) -> Result<Self, MountError<D, D::Error>> {
-        Self::mount_selected(device, options, None, None).await
+        Self::mount_selected(device, options, None, None, false).await
     }
 
     /// Mounts exactly one volume selected by index, object identifier, UUID or
@@ -250,7 +268,29 @@ impl<D: BlockDevice> ApfsFs<D> {
         options: MountOptions,
         selector: VolumeSelector<'_>,
     ) -> Result<Self, MountError<D, D::Error>> {
-        Self::mount_selected(device, options, Some(selector), None).await
+        Self::mount_selected(device, options, Some(selector), None, false).await
+    }
+
+    /// Mounts the sole supported volume for experimental existing-volume writes.
+    ///
+    /// Unsupported container layouts fail before any writes. `read_only`
+    /// options are rejected rather than silently granting write access.
+    #[cfg(feature = "write")]
+    pub async fn mount_writable(
+        device: D,
+        options: MountOptions,
+    ) -> Result<Self, MountError<D, D::Error>> {
+        Self::mount_selected(device, options, None, None, true).await
+    }
+
+    /// Mounts an explicitly selected volume for experimental writes.
+    #[cfg(feature = "write")]
+    pub async fn mount_volume_writable(
+        device: D,
+        options: MountOptions,
+        selector: VolumeSelector<'_>,
+    ) -> Result<Self, MountError<D, D::Error>> {
+        Self::mount_selected(device, options, Some(selector), None, true).await
     }
 
     /// Mounts the sole software-encrypted, single-key volume using a password.
@@ -268,7 +308,7 @@ impl<D: BlockDevice> ApfsFs<D> {
         password: &[u8],
         crypto_user: Option<[u8; 16]>,
     ) -> Result<Self, MountError<D, D::Error>> {
-        Self::mount_selected(device, options, None, Some((password, crypto_user))).await
+        Self::mount_selected(device, options, None, Some((password, crypto_user)), false).await
     }
 
     /// Mounts an explicitly selected software-encrypted volume using a password.
@@ -284,7 +324,7 @@ impl<D: BlockDevice> ApfsFs<D> {
         password: &[u8],
         crypto_user: Option<[u8; 16]>,
     ) -> Result<Self, MountError<D, D::Error>> {
-        Self::mount_selected(device, options, Some(selector), Some((password, crypto_user))).await
+        Self::mount_selected(device, options, Some(selector), Some((password, crypto_user)), false).await
     }
 
     async fn mount_selected(
@@ -292,7 +332,11 @@ impl<D: BlockDevice> ApfsFs<D> {
         options: MountOptions,
         selector: Option<VolumeSelector<'_>>,
         credentials: Option<(&[u8], Option<[u8; 16]>)>,
+        writable: bool,
     ) -> Result<Self, MountError<D, D::Error>> {
+        if writable && options.is_read_only() {
+            return Err(MountError::new(ErrorKind::InvalidInput.into(), device));
+        }
         let mut container = Container::try_open(device).await?;
         let selected = match Self::select_volume(&mut container, selector, credentials).await {
             Ok(selected) => selected,
@@ -304,7 +348,18 @@ impl<D: BlockDevice> ApfsFs<D> {
             checkpoint,
             volume,
             nodes: Nodes::new(options.node_limit()),
+            #[cfg(feature = "write")]
+            writable,
+            #[cfg(feature = "write")]
+            uses: BTreeMap::new(),
         };
+        let _ = writable;
+        #[cfg(feature = "write")]
+        if fs.writable {
+            if let Err(error) = fs.container.validate_write(&fs.checkpoint, &fs.volume).await {
+                return Err(MountError::new(error, fs.container.into_inner()));
+            }
+        }
         match fs.check_root().await {
             Ok(()) => Ok(fs),
             Err(error) => Err(MountError::new(error, fs.container.into_inner())),
@@ -404,9 +459,12 @@ impl<D: BlockDevice> ApfsFs<D> {
         self.container.into_inner()
     }
 
-    /// Unmounts the read-only driver and returns its device.
+    /// Unmounts the driver and returns its device after flushing a writable mount.
     #[cfg_attr(feature = "tracing", tracing::instrument(target = "hadris::apfs", level = "trace", skip_all))]
-    pub async fn unmount(self) -> Result<D, MountError<D, D::Error>> {
+    pub async fn unmount(mut self) -> Result<D, MountError<D, D::Error>> {
+        if let Err(error) = self.sync().await {
+            return Err(MountError::new(error, self.container.into_inner()));
+        }
         Ok(self.container.into_inner())
     }
 
@@ -415,6 +473,10 @@ impl<D: BlockDevice> ApfsFs<D> {
     /// node, which fails here from then on.
     async fn inode(&mut self, node: NodeId) -> FsResult<InodeRecord, D::Error> {
         let id = node.get();
+        #[cfg(feature = "write")]
+        if self.uses.get(&id).is_some_and(|state| state.removed) {
+            return Err(ErrorKind::NotFound.into());
+        }
         if let Some(reason) = self.nodes.damaged.get(&id) {
             return Err(Error::new(ErrorKind::Corrupt, reason));
         }
@@ -659,6 +721,10 @@ impl<D: BlockDevice> ApfsFs<D> {
         for field in [Field::Created, Field::Modified, Field::Changed, Field::Accessed, Field::Permissions, Field::Owner] {
             capabilities = capabilities.with_stored(field, Stored::Yes);
         }
+        #[cfg(feature = "write")]
+        if self.writable {
+            capabilities = capabilities.with_writable();
+        }
         capabilities
     }
 
@@ -695,24 +761,7 @@ impl<D: BlockDevice> ApfsFs<D> {
     #[cfg_attr(feature = "tracing", tracing::instrument(target = "hadris::apfs", level = "trace", skip_all, fields(dir = ?dir)))]
     /// Performs the [`FileSystem::lookup`] operation.
     pub async fn lookup(&mut self, dir: NodeId, name: &Name) -> FsResult<NodeId, D::Error> {
-        name.check()?;
-        self.directory(dir).await?;
-        let comparison = self.volume.name_comparison();
-        let found = {
-            let entries = self.directory_entries(dir.get()).await?;
-            entries
-                .iter()
-                .find(|entry| entry.name == name.as_bytes())
-                .or_else(|| {
-                    let wanted = name.to_str().ok()?;
-                    entries.iter().find(|entry| {
-                        core::str::from_utf8(&entry.name)
-                            .is_ok_and(|stored| comparison.matches(stored, wanted))
-                    })
-                })
-                .map(|entry| (entry.file_id, entry.flags))
-        };
-        let (file_id, flags) = found.ok_or(ErrorKind::NotFound)?;
+        let (file_id, flags) = self.find_entry(dir, name).await?.ok_or(ErrorKind::NotFound)?;
         let node = NodeId::new(file_id).ok_or(ErrorKind::Corrupt)?;
         // Reading the node records the damage its entry implies, so that a
         // later `stat` fails for it without reading the directory again.
@@ -728,6 +777,8 @@ impl<D: BlockDevice> ApfsFs<D> {
             Err(error) if is_resource(error.kind()) => return Err(error),
             Err(_) => {}
         }
+        #[cfg(feature = "write")]
+        self.pin(node)?;
         Ok(node)
     }
 
@@ -735,6 +786,19 @@ impl<D: BlockDevice> ApfsFs<D> {
     /// dropped, so they stop counting against
     /// [`MountOptions::with_node_limit`].
     pub fn forget(&mut self, node: NodeId, count: u64) {
+        if node == self.root() {
+            return;
+        }
+        #[cfg(feature = "write")]
+        {
+            if let Some(state) = self.uses.get_mut(&node.get()) {
+                state.pins = state.pins.saturating_sub(count);
+                if state.pins != 0 || state.opens != 0 {
+                    return;
+                }
+            }
+            self.uses.remove(&node.get());
+        }
         let _ = count;
         self.nodes.release(node.get());
     }
@@ -746,6 +810,8 @@ impl<D: BlockDevice> ApfsFs<D> {
         if dir == self.root() { return Ok(dir); }
         let parent = NodeId::new(inode.parent_id).ok_or(ErrorKind::Corrupt)?;
         self.directory(parent).await?;
+        #[cfg(feature = "write")]
+        self.pin(parent)?;
         Ok(parent)
     }
 
@@ -808,14 +874,34 @@ impl<D: BlockDevice> ApfsFs<D> {
             FileType::File => {},
             _ => return Err(ErrorKind::Unsupported.into()),
         }
-        if mode == OpenMode::Write { return Err(ErrorKind::ReadOnly.into()); }
+        if mode == OpenMode::Write {
+            #[cfg(feature = "write")]
+            self.require_writable()?;
+            #[cfg(not(feature = "write"))]
+            return Err(ErrorKind::ReadOnly.into());
+        }
         if inode.is_compressed() { return Err(crate::ApfsError::Unsupported("compressed file data").into()); }
+        #[cfg(feature = "write")]
+        {
+            let state = self.uses.entry(node.get()).or_default();
+            state.opens = state.opens.checked_add(1).ok_or(ErrorKind::LimitExceeded)?;
+        }
         Ok(())
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(target = "hadris::apfs", level = "trace", skip_all, fields(node = ?node)))]
     /// Performs the [`FileSystem::close`] operation.
     pub async fn close(&mut self, node: NodeId) -> FsResult<(), D::Error> {
+        #[cfg(feature = "write")]
+        {
+            if let Some(state) = self.uses.get_mut(&node.get()) {
+                state.opens = state.opens.saturating_sub(1);
+                if state.pins == 0 && state.opens == 0 {
+                    self.uses.remove(&node.get());
+                    self.nodes.release(node.get());
+                }
+            }
+        }
         let _ = node;
         Ok(())
     }
@@ -841,13 +927,305 @@ impl<D: BlockDevice> ApfsFs<D> {
             .await
     }
 }
+
+impl<D: BlockDevice> ApfsFs<D> {
+    async fn find_entry(&mut self, dir: NodeId, name: &Name) -> FsResult<Option<(u64, u16)>, D::Error> {
+        name.check()?;
+        self.directory(dir).await?;
+        let comparison = self.volume.name_comparison();
+        let entries = self.directory_entries(dir.get()).await?;
+        Ok(entries.iter().find(|entry| entry.name == name.as_bytes()).or_else(|| {
+            let wanted = name.to_str().ok()?;
+            entries.iter().find(|entry| {
+                core::str::from_utf8(&entry.name)
+                    .is_ok_and(|stored| comparison.matches(stored, wanted))
+            })
+        }).map(|entry| (entry.file_id, entry.flags)))
+    }
+
+    #[cfg(feature = "write")]
+    /// Flushes the device on a writable mount; read-only mounts have no changes.
+    pub async fn sync(&mut self) -> FsResult<(), D::Error> {
+        if self.writable {
+            self.container.flush_write().await?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "write")]
+impl<D: BlockDevice> ApfsFs<D> {
+    fn require_writable(&self) -> FsResult<(), D::Error> {
+        if self.writable { Ok(()) } else { Err(ErrorKind::ReadOnly.into()) }
+    }
+
+    fn pin(&mut self, node: NodeId) -> FsResult<(), D::Error> {
+        if node != self.root() {
+            let state = self.uses.entry(node.get()).or_default();
+            state.pins = state.pins.checked_add(1).ok_or(ErrorKind::LimitExceeded)?;
+        }
+        Ok(())
+    }
+
+    fn reserve_created_node(&self) -> FsResult<(), D::Error> {
+        let Some(limit) = self.nodes.limit else {
+            return Ok(());
+        };
+        let cached = |node: &u64| {
+            self.nodes.inodes.contains_key(node) || self.nodes.damaged.contains_key(node)
+        };
+        let active = self.uses.iter()
+            .filter(|(node, state)| (state.pins != 0 || state.opens != 0) && !cached(node))
+            .count();
+        let root = self.root().get();
+        let root_missing = usize::from(!cached(&root));
+        let held = self.nodes.inodes.len()
+            .checked_add(self.nodes.damaged.len())
+            .and_then(|count| count.checked_add(active))
+            .and_then(|count| count.checked_add(root_missing))
+            .ok_or(ErrorKind::LimitExceeded)?;
+        if held >= limit {
+            return Err(ErrorKind::LimitExceeded.into());
+        }
+        Ok(())
+    }
+
+    fn mutation_name(&self, name: &Name) -> FsResult<(), D::Error> {
+        name.check()?;
+        name.to_str().map_err(|_| ErrorKind::InvalidInput)?;
+        if name.as_bytes().len() > self.capabilities().max_name_bytes() {
+            return Err(ErrorKind::NameTooLong.into());
+        }
+        Ok(())
+    }
+
+    fn check_removal(&self, inode: &InodeRecord) -> FsResult<(), D::Error> {
+        if inode.link_or_child_count <= 1
+            && self.uses.get(&inode.id).is_some_and(|state| state.opens != 0)
+        {
+            return Err(ErrorKind::Busy.into());
+        }
+        Ok(())
+    }
+
+    fn removed(&mut self, node: u64) {
+        if let Some(state) = self.uses.get_mut(&node) {
+            if state.pins != 0 {
+                state.removed = true;
+            } else {
+                self.uses.remove(&node);
+            }
+        }
+    }
+
+    async fn mutate(&mut self, operation: crate::write::WriteOperation<'_>) -> FsResult<Option<u64>, D::Error> {
+        let result = self.container.mutate(&mut self.checkpoint, &mut self.volume, operation).await;
+        self.nodes = Nodes::new(self.nodes.limit);
+        result
+    }
+
+    async fn writable_file(&mut self, node: NodeId) -> FsResult<(), D::Error> {
+        self.require_writable()?;
+        let inode = self.inode(node).await?;
+        match file_type::<D::Error>(&inode)? {
+            FileType::File => {}
+            FileType::Dir => return Err(ErrorKind::IsADirectory.into()),
+            FileType::Symlink => return Err(ErrorKind::Symlink.into()),
+            _ => return Err(ErrorKind::Unsupported.into()),
+        }
+        if inode.is_compressed() {
+            return Err(crate::ApfsError::Unsupported("compressed file data").into());
+        }
+        Ok(())
+    }
+
+    /// Persists supported inode times, permissions and ownership.
+    pub async fn setattr(&mut self, node: NodeId, changes: &SetAttr) -> FsResult<(), D::Error> {
+        self.require_writable()?;
+        self.inode(node).await?;
+        self.mutate(crate::write::WriteOperation::SetAttr { node: node.get(), attrs: changes }).await?;
+        Ok(())
+    }
+
+    /// Writes file data, zero-filling a gap and growing the file as needed.
+    pub async fn write(&mut self, node: NodeId, offset: u64, buf: &[u8]) -> FsResult<usize, D::Error> {
+        self.writable_file(node).await?;
+        let len = u64::try_from(buf.len()).map_err(|_| ErrorKind::LimitExceeded)?;
+        offset.checked_add(len).ok_or(ErrorKind::LimitExceeded)?;
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        self.mutate(crate::write::WriteOperation::Write { node: node.get(), offset, data: buf }).await?;
+        Ok(buf.len())
+    }
+
+    /// Truncates or zero-extends a file.
+    pub async fn truncate(&mut self, node: NodeId, len: u64) -> FsResult<(), D::Error> {
+        self.writable_file(node).await?;
+        self.mutate(crate::write::WriteOperation::Truncate { node: node.get(), len }).await?;
+        Ok(())
+    }
+
+    /// Flushes a node's already-published checkpoint and the device.
+    pub async fn fsync(&mut self, node: NodeId) -> FsResult<(), D::Error> {
+        self.inode(node).await?;
+        self.sync().await
+    }
+
+    async fn create_node(&mut self, dir: NodeId, name: &Name, attrs: &SetAttr, directory: bool) -> FsResult<NodeId, D::Error> {
+        self.require_writable()?;
+        self.mutation_name(name)?;
+        if self.find_entry(dir, name).await?.is_some() {
+            return Err(ErrorKind::AlreadyExists.into());
+        }
+        self.reserve_created_node()?;
+        let id = self.mutate(crate::write::WriteOperation::Create {
+            parent: dir.get(), name: name.as_bytes(), directory, attrs,
+        }).await?.ok_or(ErrorKind::Corrupt)?;
+        let node = NodeId::new(id).ok_or(ErrorKind::Corrupt)?;
+        self.pin(node)?;
+        Ok(node)
+    }
+
+    /// Creates and pins an empty file.
+    pub async fn create(&mut self, dir: NodeId, name: &Name, attrs: &SetAttr) -> FsResult<NodeId, D::Error> {
+        self.create_node(dir, name, attrs, false).await
+    }
+
+    /// Creates and pins an empty directory.
+    pub async fn mkdir(&mut self, dir: NodeId, name: &Name, attrs: &SetAttr) -> FsResult<NodeId, D::Error> {
+        self.create_node(dir, name, attrs, true).await
+    }
+
+    async fn remove_node(&mut self, dir: NodeId, name: &Name, directory: bool) -> FsResult<(), D::Error> {
+        self.require_writable()?;
+        self.mutation_name(name)?;
+        let (id, _) = self.find_entry(dir, name).await?.ok_or(ErrorKind::NotFound)?;
+        let node = NodeId::new(id).ok_or(ErrorKind::Corrupt)?;
+        let inode = self.inode(node).await?;
+        let kind = file_type::<D::Error>(&inode)?;
+        if directory {
+            if !kind.is_dir() {
+                return Err(ErrorKind::NotADirectory.into());
+            }
+            if !self.directory_entries(id).await?.is_empty() {
+                return Err(ErrorKind::DirectoryNotEmpty.into());
+            }
+        } else if kind.is_dir() {
+            return Err(ErrorKind::IsADirectory.into());
+        }
+        self.check_removal(&inode)?;
+        self.mutate(crate::write::WriteOperation::Remove {
+            parent: dir.get(), name: name.as_bytes(), directory,
+        }).await?;
+        if directory || inode.link_or_child_count <= 1 {
+            self.removed(id);
+        }
+        Ok(())
+    }
+
+    /// Removes a non-directory entry, refusing the last name of an open file.
+    pub async fn unlink(&mut self, dir: NodeId, name: &Name) -> FsResult<(), D::Error> {
+        self.remove_node(dir, name, false).await
+    }
+
+    /// Removes an empty directory.
+    pub async fn rmdir(&mut self, dir: NodeId, name: &Name) -> FsResult<(), D::Error> {
+        self.remove_node(dir, name, true).await
+    }
+
+    /// Moves a node without changing its id, optionally replacing the target.
+    pub async fn rename(
+        &mut self,
+        from_dir: NodeId,
+        from: &Name,
+        to_dir: NodeId,
+        to: &Name,
+        mode: RenameMode,
+    ) -> FsResult<(), D::Error> {
+        self.require_writable()?;
+        self.mutation_name(from)?;
+        self.mutation_name(to)?;
+        let replace = match mode {
+            RenameMode::Replace => true,
+            RenameMode::NoReplace => false,
+            _ => return Err(ErrorKind::Unsupported.into()),
+        };
+        let (source, _) = self.find_entry(from_dir, from).await?.ok_or(ErrorKind::NotFound)?;
+        let source_node = NodeId::new(source).ok_or(ErrorKind::Corrupt)?;
+        let inode = self.inode(source_node).await?;
+        let source_is_dir = file_type::<D::Error>(&inode)?.is_dir();
+        let target = self.find_entry(to_dir, to).await?;
+        let mut removed = None;
+        if let Some((target, _)) = target {
+            if !replace {
+                return Err(ErrorKind::AlreadyExists.into());
+            }
+            if target != source {
+                let target_inode = self.inode(NodeId::new(target).ok_or(ErrorKind::Corrupt)?).await?;
+                let target_is_dir = file_type::<D::Error>(&target_inode)?.is_dir();
+                if source_is_dir && !target_is_dir {
+                    return Err(ErrorKind::NotADirectory.into());
+                }
+                if !source_is_dir && target_is_dir {
+                    return Err(ErrorKind::IsADirectory.into());
+                }
+                if target_is_dir && !self.directory_entries(target).await?.is_empty() {
+                    return Err(ErrorKind::DirectoryNotEmpty.into());
+                }
+                self.check_removal(&target_inode)?;
+                if target_is_dir || target_inode.link_or_child_count <= 1 {
+                    removed = Some(target);
+                }
+            } else if from_dir != to_dir || from.as_bytes() == to.as_bytes() {
+                return Ok(());
+            }
+        }
+        if source_is_dir {
+            let mut ancestor = to_dir;
+            let mut remaining = self.volume.number_directories.checked_add(1).ok_or(ErrorKind::Corrupt)?;
+            loop {
+                if ancestor == source_node {
+                    return Err(ErrorKind::InvalidInput.into());
+                }
+                if ancestor == self.root() {
+                    break;
+                }
+                if remaining == 0 {
+                    return Err(ErrorKind::Corrupt.into());
+                }
+                remaining -= 1;
+                let parent = self.directory(ancestor).await?.parent_id;
+                ancestor = NodeId::new(parent).ok_or(ErrorKind::Corrupt)?;
+            }
+        }
+        self.mutate(crate::write::WriteOperation::Rename {
+            from_parent: from_dir.get(), from: from.as_bytes(),
+            to_parent: to_dir.get(), to: to.as_bytes(), replace,
+        }).await?;
+        if let Some(target) = removed {
+            self.removed(target);
+        }
+        Ok(())
+    }
+}
+#[cfg(not(feature = "write"))]
 hadris_fs::__forward_filesystem! {
     async fn ApfsFs<D: BlockDevice> as FileSystem { read }
 }
+#[cfg(feature = "write")]
+hadris_fs::__forward_filesystem! {
+    async fn ApfsFs<D: BlockDevice> as FileSystem { read write }
+}
 
 send_filesystem! {
+#[cfg(not(feature = "write"))]
 hadris_fs::__forward_filesystem! {
     async fn ApfsFs<D: hadris_storage::async_::SendBlockDevice> as hadris_fs::async_::FileSystem { read }
+}
+#[cfg(feature = "write")]
+hadris_fs::__forward_filesystem! {
+    async fn ApfsFs<D: hadris_storage::async_::SendBlockDevice> as hadris_fs::async_::FileSystem { read write }
 }
 }
 
