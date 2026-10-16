@@ -10,6 +10,22 @@ Each published package owns its version and may be released independently.
 
 ### Added
 
+- **hadris-apfs:** With the `write` feature, `sync::format` and
+  `async_::format` create a new APFS container holding one empty,
+  unencrypted, case-sensitive volume on a writable device, configured by
+  `ApfsOptions` (label, size, time, seed or explicit UUIDs, and hashed or
+  plain directory keys) and returning `Formatted`. The layout follows the
+  out-of-tree `mkapfs` writer and gives the same container for 512- to
+  4096-byte device blocks. Block 0 and the checkpoint areas are overwritten
+  first so no older checkpoint survives, and the new checkpoint is published
+  before block 0 is written last, so an interrupted format never leaves a mix
+  of the old and new containers. The result mounts, accepts the writable
+  driver's strict validation in both key layouts, and has been read with
+  `apfs-fuse` and `apfsutil`; Apple `fsck_apfs` and macOS are not qualified.
+  Because the writable driver never reclaims blocks, a fresh container allows
+  a limited number of mutations: creating empty files stopped with `NoSpace`
+  after about 20 in 1 MiB, 270 in 16 MiB and 1,600 in 256 MiB.
+
 - **hadris-apfs:** The opt-in `write` feature adds `ApfsFs::mount_writable`
   and `mount_volume_writable` for experimental existing-volume writes:
   create, mkdir, write/grow, truncate, unlink, rmdir, rename, inode attribute
