@@ -10,6 +10,21 @@ Each published package owns its version and may be released independently.
 
 ### Added
 
+- **hadris-apfs:** The opt-in `write` feature adds `ApfsFs::mount_writable`
+  and `mount_volume_writable` for experimental existing-volume writes:
+  create, mkdir, write/grow, truncate, unlink, rmdir, rename, inode attribute
+  changes, fsync and sync. Ordinary mounts remain read-only. The writer
+  accepts a restricted 4096-byte, single-volume, unencrypted case-sensitive
+  layout, including images made by the out-of-tree `mkapfs` implementation.
+  Changed data and metadata are copied to free blocks; checkpoint maps and
+  data are flushed before the new container superblock is published and
+  flushed. Interrupted writes require reopening before further mutations.
+  Old allocations are retained, so repeated mutations eventually exhaust
+  free space. Snapshots, clones, existing sparse files, compression,
+  encryption, sealing, Fusion and active space-manager pools/queues are
+  rejected before writes. Modified images have been read independently with
+  `apfs-fuse`; native macOS writes and Apple `fsck_apfs` are not qualified.
+
 - **hadris-apfs:** `Container::filesystem_records(volume, id, record_type)`
   returns one object's records of one type in key order, descending the
   filesystem tree by key instead of walking every leaf.
