@@ -1,11 +1,12 @@
 # hadris-apfs
 
 `hadris-apfs` is an experimental APFS container reader and filesystem driver.
-Ordinary mounts are read-only; the opt-in `write` feature adds restricted
-existing-volume mutations. It supports synchronous and asynchronous I/O and
-can be used in `no_std` environments with an allocator. Its API is outside the
-Hadris 3.x stability promise and may change in a minor release; depend on it
-with `hadris-apfs = "~3.0"` to take only compatible updates.
+Ordinary mounts are read-only; the opt-in `write` feature adds formatting of
+new containers and restricted existing-volume mutations. It supports
+synchronous and asynchronous I/O and can be used in `no_std` environments with
+an allocator. Its API is outside the Hadris 3.x stability promise and may
+change in a minor release; depend on it with `hadris-apfs = "~3.0"` to take
+only compatible updates.
 
 The crate is suitable for inspecting unencrypted APFS images and, with the
 `encryption` feature, password-encrypted single-key APFS volumes made by macOS. It
@@ -136,11 +137,61 @@ also mounted with the independent `apfs-fuse` reader, checking file bytes and
 Unicode names. Apple `fsck_apfs` and native macOS write interoperability have
 not been qualified.
 
+## Creating a container
+
+With `write`, `sync::format` and `async_::format` turn a writable block device
+into a new APFS container holding one empty, unencrypted, case-sensitive
+volume. Mount the result with `ApfsFs::mount`, or with `ApfsFs::mount_writable`
+to add files.
+
+```text
+let mut device = FileDevice::new(file)?;
+let options = ApfsOptions::new().with_label("Data").with_size(64 << 20);
+let formatted = format(&mut device, &options)?;
+let fs = ApfsFs::mount_writable(device, MountOptions::new())?;
+```
+
+The container fills the device, rounded down to whole 4096-byte blocks, unless
+`ApfsOptions::with_size` asks for another size; a device that grows when
+written, such as a host file, is grown to fit. The device's blocks may be 512,
+1024, 2048 or 4096 bytes and give the same container. The layout follows the
+out-of-tree `mkapfs` writer: an 8-block checkpoint descriptor area, a 52-block
+checkpoint data area, then the space manager, object maps and trees, with the
+root directory and the private directory APFS keeps beside it. A container
+can be about 3 TiB at most.
+
+The label, time and UUIDs are options. Without a seed or explicit UUIDs, the
+UUIDs derive from the time, label and size, so two formats with the same
+options give the same identifiers; give volumes that must stay distinguishable
+distinct seeds or UUIDs. Directory entries use hashed keys, as a
+normalization-insensitive volume does, by default;
+`with_normalization_insensitive(false)` selects plain keys. Case-insensitive
+volumes are not offered, because the writable driver rejects them.
+
+Block 0 and the checkpoint areas are overwritten first, so no older container
+or checkpoint on the device survives. The new checkpoint is published after the
+metadata is flushed and block 0 is written last, so an interrupted format
+leaves a device that does not mount, or, when its first write fails, the
+untouched old container, and never a mix of the two. Nothing is written when
+an option or the device is invalid.
+
+A new container has a small budget of mutations, because the writable driver
+never reclaims blocks and rebuilds the filesystem tree and the allocation
+bitmaps on every change. Creating empty files one at a time on a fresh volume
+stopped with `NoSpace` after about 20 files in 1 MiB, 270 in 16 MiB, 710 in
+64 MiB and 1,600 in 256 MiB, so size a container for the changes it will take.
+
+Evidence is the independent `apfsutil` and `apfs-fuse` readers, which report
+the label and UUIDs and read both key layouts empty and after writes, plus
+tests of the layout, interrupted formats and byte-identical sync and async
+output. Apple `fsck_apfs` and macOS have not been run against a formatted
+container.
+
 ## Limitations
 
-- Ordinary mounts are read-only. Creating new containers and repairing
-  volumes are not supported; experimental existing-volume writes require the
-  explicit constructors and supported layout described above.
+- Ordinary mounts are read-only, and repairing volumes is not supported.
+  Experimental writes and formatting require the `write` feature, and writes
+  the explicit constructors and supported layout described above.
 - Compressed files (`decmpfs`) are reported as
   `ErrorKind::Unsupported` rather than decoded.
 - Software encryption requires the `encryption` feature and a password mount.

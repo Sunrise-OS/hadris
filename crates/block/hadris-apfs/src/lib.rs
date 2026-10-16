@@ -47,6 +47,11 @@
 //! metadata and ordered checkpoint publication, retaining old allocations
 //! without reclaiming them. Unsupported layouts are rejected before writes.
 //!
+//! `sync::format` and `async_::format` also need `write`: they create a new
+//! container with one empty volume on a writable device, which
+//! `ApfsFs::mount_writable` can then fill. The README describes the layout and
+//! the limits of its space budget.
+//!
 //! ```rust,no_run
 //! use std::fs::File;
 //!
@@ -94,6 +99,8 @@ pub mod read;
 pub mod sync;
 
 pub use error::{ApfsError, Detail, Result};
+#[cfg(all(feature = "write", any(feature = "sync", feature = "async")))]
+pub use write::mkfs::{ApfsOptions, Formatted};
 
 /// Selects the volume to mount within an APFS container.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

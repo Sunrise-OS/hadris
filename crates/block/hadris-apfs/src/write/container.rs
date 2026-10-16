@@ -5,7 +5,7 @@ use alloc::{collections::BTreeSet, vec, vec::Vec};
 use crate::types::{ContainerSuperblock, VolumeSuperblock, ObjectMapBlock, ObjectMapValue, OwnedEntry, VirtualObjectMap, FileExtentRecord};
 use crate::types::{le_u32,le_u64};
 use crate::types::checksum::verify_object;
-use crate::write::{self, Allocation, AllocationChunk, Records, WriteOperation, BLOCK, entry,key,object,seal,w32,w64,unsupported};
+use crate::write::{self, Allocation, AllocationChunk, Records, WriteOperation, BLOCK, entry,key,object,omap,omap_entry,seal,w32,w64,unsupported};
 use hadris_fs::{Error,ErrorKind,FsResult};
 use hadris_storage::BlockIndex;
 
@@ -15,8 +15,6 @@ struct State {
     extents:Vec<FileExtentRecord>, desc_index:u32, data_index:u32,
 }
 fn write_error<E>(e:crate::ApfsError)->Error<E>{match e {crate::ApfsError::InvalidValue("APFS write space exhausted")=>Error::new(ErrorKind::NoSpace,"APFS write space exhausted (old allocations are retained)"),other=>other.into()}}
-fn omap_entry(oid:u64,block:u64,xid:u64)->OwnedEntry{let mut k=oid.to_le_bytes().to_vec();k.extend_from_slice(&xid.to_le_bytes());let mut v=vec![0;16];w32(&mut v,4,BLOCK as u32);w64(&mut v,8,block);entry(k,v)}
-fn omap(block:u64,root:u64,xid:u64,flags:u32)->Vec<u8>{let mut b=object(block,xid,0x4000_000b,0);w32(&mut b,32,flags);w32(&mut b,40,0x4000_0002);w32(&mut b,44,0x4000_0002);w64(&mut b,48,root);seal(&mut b);b}
 fn extent_entries(extents:&[FileExtentRecord])->Vec<OwnedEntry>{let mut result=Vec::with_capacity(extents.len());for e in extents{let mut v=vec![0;20];w64(&mut v,0,(e.length/BLOCK as u64)|(1<<60));w64(&mut v,8,e.id);w32(&mut v,16,1);result.push(entry(key(e.physical_block,1),v));}result.sort_by_key(|e|le_u64(&e.key,0).unwrap_or(0)&0x0fff_ffff_ffff_ffff);result}
 fn free_ring_pair<E>(count:u32,start:u32,len:u32,next:u32)->FsResult<u32,E>{
     if count<4 || start>=count || len==0 || len>count-2 || next>=count{return Err(unsupported("APFS checkpoint ring geometry for writes"));}

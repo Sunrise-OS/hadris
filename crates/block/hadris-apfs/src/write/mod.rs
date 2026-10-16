@@ -11,6 +11,7 @@ use core::cmp::Ordering;
 use hadris_fs::{Error, ErrorKind, FsResult, SetAttr};
 
 pub(crate) mod btree;
+pub(crate) mod mkfs;
 pub(crate) const BLOCK: usize = 4096;
 
 pub(crate) enum WriteOperation<'a> {
@@ -74,6 +75,23 @@ pub(crate) fn key(id: u64, kind: u8) -> Vec<u8> {
 pub(crate) fn entry(key: Vec<u8>, value: Vec<u8>) -> OwnedEntry {
     OwnedEntry { key, value }
 }
+pub(crate) fn omap_entry(oid: u64, block: u64, xid: u64) -> OwnedEntry {
+    let mut k = oid.to_le_bytes().to_vec();
+    k.extend_from_slice(&xid.to_le_bytes());
+    let mut v = vec![0; 16];
+    w32(&mut v, 4, BLOCK as u32);
+    w64(&mut v, 8, block);
+    entry(k, v)
+}
+pub(crate) fn omap(block: u64, root: u64, xid: u64, flags: u32) -> Vec<u8> {
+    let mut b = object(block, xid, 0x4000_000b, 0);
+    w32(&mut b, 32, flags);
+    w32(&mut b, 40, 0x4000_0002);
+    w32(&mut b, 44, 0x4000_0002);
+    w64(&mut b, 48, root);
+    seal(&mut b);
+    b
+}
 fn raw64(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(b[at..at + 8].try_into().expect("validated key"))
 }
@@ -120,7 +138,7 @@ fn name_hash(text: &str) -> u32 {
     }
     crc & 0x3f_ffff
 }
-fn drec_key(parent: u64, text: &str, hashed: bool) -> Vec<u8> {
+pub(crate) fn drec_key(parent: u64, text: &str, hashed: bool) -> Vec<u8> {
     let mut k = key(parent, 9);
     if hashed {
         k.extend_from_slice(&((name_hash(text) << 10) | (text.len() as u32 + 1)).to_le_bytes());
@@ -131,7 +149,7 @@ fn drec_key(parent: u64, text: &str, hashed: bool) -> Vec<u8> {
     k.push(0);
     k
 }
-fn timestamp<E>(t: hadris_fs::DateTime) -> FsResult<u64, E> {
+pub(crate) fn timestamp<E>(t: hadris_fs::DateTime) -> FsResult<u64, E> {
     u64::try_from(t.unix_seconds())
         .ok()
         .and_then(|v| v.checked_mul(1_000_000_000))

@@ -1,5 +1,5 @@
 use crate::common::BLOCK;
-use crate::common::write::{BLOCK_COUNT, image};
+use crate::common::write::image;
 use hadris_io::{Error, ErrorKind};
 use hadris_storage::{BlockIndex, BlockSize};
 
@@ -11,9 +11,14 @@ pub struct FaultDevice {
 }
 
 impl FaultDevice {
+    #[allow(dead_code)]
     pub fn new() -> Self {
+        Self::from_bytes(image())
+    }
+
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
         Self {
-            bytes: image(),
+            bytes,
             events: 0,
             fail_at: None,
             torn: false,
@@ -43,7 +48,7 @@ impl hadris_storage::sync::BlockDevice for FaultDevice {
         BlockSize::new(BLOCK as u32).unwrap()
     }
     fn block_count(&self) -> u64 {
-        BLOCK_COUNT as u64
+        (self.bytes.len() / BLOCK) as u64
     }
     fn writable(&self) -> bool {
         true

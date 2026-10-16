@@ -20,6 +20,12 @@ mod fs;
 #[cfg(feature = "alloc")]
 pub use fs::ApfsFs;
 
+#[cfg(feature = "write")]
+#[path = "../write/format.rs"]
+mod mkfs;
+#[cfg(feature = "write")]
+pub use mkfs::format;
+
 #[cfg(all(feature = "alloc", not(feature = "write")))]
 hadris_fs::__forward_filesystem! {
     shims ApfsFs<D: storage::BlockDevice> { resolve write }

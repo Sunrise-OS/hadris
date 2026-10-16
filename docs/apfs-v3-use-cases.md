@@ -4,7 +4,8 @@ APFS has a container holding volumes. A container is an inspection object; a
 mounted volume is a filesystem. The V3 port keeps those two operations distinct
 and measures the driver through the same `FileSystem` contract as other formats.
 APFS remains experimental. Ordinary mounts are read-only; explicit writable
-mounts require the opt-in `write` feature and a restricted supported layout.
+mounts and formatting a new container require the opt-in `write` feature, and
+writes a restricted supported layout.
 
 Opt-in [software APFS encryption](apfs-encryption.md) is qualified against
 native macOS fixtures; Asahi's hardware unlock path remains a separate milestone.

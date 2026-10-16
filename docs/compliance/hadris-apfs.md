@@ -21,7 +21,8 @@ crafted images exercise checkpoint fallback, per-node damage and feature
 refusal, and the `apfs_read` fuzz target runs locally. Experimental writes are
 opt-in and restricted to the layout documented in the
 [write scope](../../crates/block/hadris-apfs/README.md#experimental-writes).
-Persistence and interrupted-checkpoint tests exercise that subset, and a
-modified `mkapfs` image has been read with independent `apfs-fuse`; this is not
-Apple `fsck_apfs` or native macOS write qualification. Snapshots, Fusion
-containers, hardware-encrypted volumes and per-file keys remain out of scope.
+Persistence, interrupted-checkpoint and format tests exercise that subset, and
+modified or newly formatted images have been read with the independent
+`apfs-fuse` and `apfsutil`; this is not Apple `fsck_apfs` or native macOS write
+or format qualification. Snapshots, Fusion containers, hardware-encrypted
+volumes and per-file keys remain out of scope.

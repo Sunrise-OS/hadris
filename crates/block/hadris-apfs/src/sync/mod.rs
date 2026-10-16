@@ -21,3 +21,9 @@ pub use container::Container;
 mod fs;
 #[cfg(feature = "alloc")]
 pub use fs::ApfsFs;
+
+#[cfg(feature = "write")]
+#[path = "../write/format.rs"]
+mod mkfs;
+#[cfg(feature = "write")]
+pub use mkfs::format;
