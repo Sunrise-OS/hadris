@@ -11,10 +11,8 @@ use alloc::vec::Vec;
 
 use hadris_fs::{DateTime, ErrorKind};
 
-use super::{
-    BLOCK, btree, drec_key, entry, fs_cmp, key, object, omap, omap_entry, seal, timestamp, w16,
-    w32, w64,
-};
+use super::tree::{self, ApfsNode};
+use super::{BLOCK, btree, object, omap, omap_entry, seal, timestamp, w32, w64};
 use crate::types::OwnedEntry;
 use crate::{ApfsError, Result};
 
@@ -30,16 +28,6 @@ const OID_REAPER: u64 = 0x401;
 const OID_VOLUME: u64 = 0x402;
 const OID_FS_ROOT: u64 = 0x403;
 
-const ROOT_PARENT_ID: u64 = 1;
-const ROOT_DIR_ID: u64 = 2;
-const PRIVATE_DIR_ID: u64 = 3;
-const FIRST_USER_ID: u64 = 16;
-
-const DT_DIR: u16 = 4;
-const S_IFDIR: u16 = 0o040000;
-const INODE_IS_APFS_PRIVATE: u64 = 1;
-const INO_EXT_TYPE_NAME: u8 = 4;
-const XF_DO_NOT_COPY: u8 = 2;
 const INCOMPAT_NORMALIZATION_INSENSITIVE: u64 = 8;
 
 const OBJ_PHYSICAL: u32 = 0x4000_0000;
@@ -69,6 +57,7 @@ pub struct ApfsOptions {
     pub(crate) container_uuid: Option<[u8; 16]>,
     pub(crate) volume_uuid: Option<[u8; 16]>,
     pub(crate) normalization_insensitive: bool,
+    pub(crate) root: Option<ApfsNode>,
 }
 
 impl Default for ApfsOptions {
@@ -89,6 +78,7 @@ impl ApfsOptions {
             container_uuid: None,
             volume_uuid: None,
             normalization_insensitive: true,
+            root: None,
         }
     }
 
@@ -145,6 +135,21 @@ impl ApfsOptions {
         self.normalization_insensitive = insensitive;
         self
     }
+
+    /// Fills the volume with the files, directories and symbolic links of
+    /// `root`, which must be a directory and becomes the volume's root
+    /// directory, with its own mode and owner. The container is built in one
+    /// pass, with every file stored in a single contiguous extent, so it is
+    /// not subject to the small mutation budget of a container that is
+    /// written to afterwards, and it can be as full as the container allows.
+    /// A format fails with `NoSpace` when the tree does not fit,
+    /// `InvalidInput` when the root is not a directory or a symbolic link
+    /// target is empty, over 1024 bytes or holds a NUL, and `AlreadyExists`
+    /// when a directory holds two names the volume compares equal.
+    pub fn with_root(mut self, root: ApfsNode) -> Self {
+        self.root = Some(root);
+        self
+    }
 }
 
 /// What `format` created.
@@ -179,11 +184,53 @@ fn derive_uuid(material: &[u8], tag: u8) -> [u8; 16] {
     uuid
 }
 
-fn once(oid: u64, block: u64) -> impl FnMut() -> Result<(u64, u64)> {
-    let mut slot = Some((oid, block));
-    move || {
-        slot.take()
-            .ok_or(ApfsError::InvalidValue("APFS format tree needs one node"))
+const EXHAUSTED: &str = "APFS format container is full";
+
+fn plan_error(error: ApfsError) -> ErrorKind {
+    if error == ApfsError::InvalidValue(EXHAUSTED) {
+        ErrorKind::NoSpace
+    } else {
+        ErrorKind::LimitExceeded
+    }
+}
+
+/// Hands out blocks in order, stepping over the two blocks whose numbers are
+/// the ephemeral object identifiers of the space manager and the reaper, so a
+/// reader that falls back to a physical read of those never finds an object.
+struct Alloc {
+    next: u64,
+    limit: u64,
+}
+
+impl Alloc {
+    fn data(&mut self, count: u64) -> Result<u64> {
+        let end = self
+            .next
+            .checked_add(count)
+            .filter(|end| *end <= self.limit)
+            .ok_or(ApfsError::InvalidValue(EXHAUSTED))?;
+        let at = self.next;
+        self.next = end;
+        Ok(at)
+    }
+
+    fn meta(&mut self, count: u64) -> Result<u64> {
+        loop {
+            let end = self.next.saturating_add(count);
+            match [OID_SPACEMAN, OID_REAPER]
+                .iter()
+                .find(|oid| (self.next..end).contains(*oid))
+            {
+                Some(oid) => self.next = oid + 1,
+                None => break,
+            }
+        }
+        self.data(count)
+    }
+
+    fn node(&mut self) -> Result<(u64, u64)> {
+        let block = self.meta(1)?;
+        Ok((block, block))
     }
 }
 
@@ -195,24 +242,18 @@ pub(crate) struct Plan {
     cib_start: u64,
     pub(crate) bitmap_start: u64,
     cont_omap: u64,
-    cont_tree: u64,
-    apsb: u64,
-    vol_omap: u64,
-    vol_tree: u64,
-    extentref: u64,
-    snapmeta: u64,
-    fs_tree: u64,
     /// Blocks `0..used` are allocated; everything after is free.
     pub(crate) used: u64,
-    hashed: bool,
-    time_ns: u64,
-    label: Vec<u8>,
+    next_oid: u64,
     container_uuid: [u8; 16],
     volume_uuid: [u8; 16],
+    data_starts: Vec<u64>,
+    metadata: Vec<(u64, Vec<u8>)>,
 }
 
 impl Plan {
-    /// Plans a container of `bytes` bytes. Nothing is written.
+    /// Plans a container of `bytes` bytes, allocating file data first and then
+    /// the bookkeeping and the trees, like `mkapfs`. Nothing is written.
     pub(crate) fn new(options: &ApfsOptions, bytes: u64) -> core::result::Result<Self, ErrorKind> {
         if bytes % BLOCK as u64 != 0 {
             return Err(ErrorKind::InvalidInput);
@@ -233,29 +274,125 @@ impl Plan {
             return Err(ErrorKind::LimitExceeded);
         }
 
-        let mut next = FIRST_FREE;
-        let mut take = |count: u64| {
-            let at = next;
-            next += count;
-            at
+        let hashed = options.normalization_insensitive;
+        let empty = ApfsNode::directory();
+        let root = options.root.as_ref().unwrap_or(&empty);
+        let mut flat = tree::flatten(root, hashed)?;
+
+        let mut alloc = Alloc {
+            next: FIRST_FREE,
+            limit: block_count,
         };
-        let cib_start = take(cib_count);
-        let bitmap_start = take(chunk_count);
-        let cont_omap = take(1);
-        let cont_tree = take(1);
-        let apsb = take(1);
-        let vol_omap = take(1);
-        let vol_tree = take(1);
-        let extentref = take(1);
-        let snapmeta = take(1);
-        let fs_tree = take(1);
-        let used = next;
+        let mut data_blocks = 0;
+        let mut data_starts = Vec::new();
+        for inode in &mut flat {
+            let count = inode.data_blocks();
+            if count > 0 {
+                inode.data_block = alloc.data(count).map_err(plan_error)?;
+                data_starts.push(inode.data_block);
+                data_blocks += count;
+            }
+        }
+        let cib_start = alloc.meta(cib_count).map_err(plan_error)?;
+        let bitmap_start = alloc.meta(chunk_count).map_err(plan_error)?;
+        let cont_omap = alloc.meta(1).map_err(plan_error)?;
+        let apsb = alloc.meta(1).map_err(plan_error)?;
+        let vol_omap = alloc.meta(1).map_err(plan_error)?;
+
+        let built = tree::records(&flat, time_ns, hashed);
+        let extentref = btree::build(&built.refs, XID, 15, true, None, &mut || alloc.node())
+            .map_err(plan_error)?;
+        let snapmeta =
+            btree::build(&[], XID, 16, true, None, &mut || alloc.node()).map_err(plan_error)?;
+        let mut next_oid = OID_FS_ROOT;
+        let fs = btree::build(&built.fs, XID, 14, false, None, &mut || {
+            let (_, block) = alloc.node()?;
+            let oid = next_oid;
+            next_oid += 1;
+            Ok((oid, block))
+        })
+        .map_err(plan_error)?;
+        let mappings: Vec<OwnedEntry> = fs
+            .mappings
+            .iter()
+            .map(|&(oid, block)| omap_entry(oid, block, XID))
+            .collect();
+        let vol_tree = btree::build(&mappings, XID, 11, true, Some((16, 16)), &mut || {
+            alloc.node()
+        })
+        .map_err(plan_error)?;
+        let cont_tree = btree::build(
+            &[omap_entry(OID_VOLUME, apsb, XID)],
+            XID,
+            11,
+            true,
+            Some((16, 16)),
+            &mut || alloc.node(),
+        )
+        .map_err(plan_error)?;
 
         let mut material = Vec::new();
         material.extend_from_slice(&options.seed.unwrap_or(0).to_le_bytes());
         material.extend_from_slice(&time_ns.to_le_bytes());
         material.extend_from_slice(&block_count.to_le_bytes());
         material.extend_from_slice(label);
+        let container_uuid = options
+            .container_uuid
+            .unwrap_or_else(|| derive_uuid(&material, 1));
+        let volume_uuid = options
+            .volume_uuid
+            .unwrap_or_else(|| derive_uuid(&material, 2));
+
+        let volume_blocks = data_blocks
+            + 2
+            + (extentref.nodes.len() + snapmeta.nodes.len() + fs.nodes.len() + vol_tree.nodes.len())
+                as u64;
+        let mut volume = object(OID_VOLUME, XID, 13, 0);
+        volume[32..36].copy_from_slice(b"APSB");
+        w64(
+            &mut volume,
+            56,
+            if hashed {
+                INCOMPAT_NORMALIZATION_INSENSITIVE
+            } else {
+                0
+            },
+        );
+        w64(&mut volume, 88, volume_blocks);
+        w32(&mut volume, 116, 2);
+        w32(&mut volume, 120, OBJ_PHYSICAL | 2);
+        w32(&mut volume, 124, OBJ_PHYSICAL | 2);
+        w64(&mut volume, 128, vol_omap);
+        w64(&mut volume, 136, fs.root_oid);
+        w64(&mut volume, 144, extentref.root_oid);
+        w64(&mut volume, 152, snapmeta.root_oid);
+        w64(&mut volume, 176, built.next_id);
+        w64(&mut volume, 184, built.files);
+        w64(&mut volume, 192, built.directories);
+        w64(&mut volume, 200, built.symlinks);
+        w64(&mut volume, 224, volume_blocks);
+        volume[240..256].copy_from_slice(&volume_uuid);
+        w64(&mut volume, 256, time_ns);
+        w64(&mut volume, 264, 1);
+        for at in [272, 320] {
+            volume[at..at + 6].copy_from_slice(b"hadris");
+            w64(&mut volume, at + 32, time_ns);
+            w64(&mut volume, at + 40, XID);
+        }
+        volume[704..704 + label.len()].copy_from_slice(label);
+        w32(&mut volume, 960, 3);
+        seal(&mut volume);
+
+        let vol_tree_root = vol_tree.root_block;
+        let cont_tree_root = cont_tree.root_block;
+        let mut metadata = Vec::new();
+        for tree in [fs, extentref, snapmeta, vol_tree, cont_tree] {
+            metadata.extend(tree.nodes);
+        }
+        metadata.push((vol_omap, omap(vol_omap, vol_tree_root, XID, 0)));
+        metadata.push((cont_omap, omap(cont_omap, cont_tree_root, XID, 1)));
+        metadata.push((apsb, volume));
+
         Ok(Self {
             block_count,
             chunk_count,
@@ -263,24 +400,22 @@ impl Plan {
             cib_start,
             bitmap_start,
             cont_omap,
-            cont_tree,
-            apsb,
-            vol_omap,
-            vol_tree,
-            extentref,
-            snapmeta,
-            fs_tree,
-            used,
-            hashed: options.normalization_insensitive,
-            time_ns,
-            label: label.to_vec(),
-            container_uuid: options
-                .container_uuid
-                .unwrap_or_else(|| derive_uuid(&material, 1)),
-            volume_uuid: options
-                .volume_uuid
-                .unwrap_or_else(|| derive_uuid(&material, 2)),
+            used: alloc.next,
+            next_oid,
+            container_uuid,
+            volume_uuid,
+            data_starts,
+            metadata,
         })
+    }
+
+    /// Where each nonempty file's data goes, with the bytes, in tree order.
+    pub(crate) fn data<'a>(&self, options: &'a ApfsOptions) -> Vec<(u64, &'a [u8])> {
+        let mut files = Vec::new();
+        if let Some(root) = &options.root {
+            tree::file_data(root, &mut files);
+        }
+        self.data_starts.iter().copied().zip(files).collect()
     }
 
     pub(crate) fn formatted(&self) -> Formatted {
@@ -312,54 +447,6 @@ impl Plan {
         DESC_BASE + 1
     }
 
-    fn inode_value(&self, id: u64, internal_flags: u64, name: &str) -> Vec<u8> {
-        let mut value = vec![0; 92];
-        w64(&mut value, 0, ROOT_PARENT_ID);
-        w64(&mut value, 8, id);
-        for at in [16, 24, 32, 40] {
-            w64(&mut value, at, self.time_ns);
-        }
-        w64(&mut value, 48, internal_flags);
-        w16(&mut value, 80, S_IFDIR | 0o755);
-        let mut data = name.as_bytes().to_vec();
-        data.push(0);
-        let length = data.len();
-        data.resize(length.div_ceil(8) * 8, 0);
-        value.extend_from_slice(&1_u16.to_le_bytes());
-        value.extend_from_slice(&((4 + data.len()) as u16).to_le_bytes());
-        value.push(INO_EXT_TYPE_NAME);
-        value.push(XF_DO_NOT_COPY);
-        value.extend_from_slice(&(length as u16).to_le_bytes());
-        value.extend_from_slice(&data);
-        value
-    }
-
-    fn directory_record(&self, name: &str, file_id: u64) -> OwnedEntry {
-        let mut value = vec![0; 18];
-        w64(&mut value, 0, file_id);
-        w64(&mut value, 8, self.time_ns);
-        w16(&mut value, 16, DT_DIR);
-        entry(drec_key(ROOT_PARENT_ID, name, self.hashed), value)
-    }
-
-    fn filesystem_records(&self) -> Vec<OwnedEntry> {
-        let mut records = vec![
-            self.directory_record("root", ROOT_DIR_ID),
-            self.directory_record("private-dir", PRIVATE_DIR_ID),
-            entry(
-                key(ROOT_DIR_ID, 3),
-                self.inode_value(ROOT_DIR_ID, 0, "root"),
-            ),
-            entry(
-                key(PRIVATE_DIR_ID, 3),
-                self.inode_value(PRIVATE_DIR_ID, INODE_IS_APFS_PRIVATE, "private-dir"),
-            ),
-        ];
-        let hashed = self.hashed;
-        records.sort_by(|a, b| fs_cmp(&a.key, &b.key, hashed));
-        records
-    }
-
     /// The container superblock of the one checkpoint.
     pub(crate) fn superblock(&self) -> Vec<u8> {
         let mut nx = object(1, XID, OBJ_EPHEMERAL | 1, 0);
@@ -368,7 +455,7 @@ impl Plan {
         w64(&mut nx, 40, self.block_count);
         w64(&mut nx, 64, 0x2);
         nx[72..88].copy_from_slice(&self.container_uuid);
-        w64(&mut nx, 88, OID_FS_ROOT + 1);
+        w64(&mut nx, 88, self.next_oid);
         w64(&mut nx, 96, XID + 1);
         w32(&mut nx, 104, DESC_BLOCKS);
         w32(&mut nx, 108, DATA_BLOCKS);
@@ -406,99 +493,11 @@ impl Plan {
         bitmap
     }
 
-    /// Every block except the bitmaps, the container superblock and the
-    /// zeroed rest of the checkpoint areas.
-    pub(crate) fn blocks(&self) -> Result<Vec<(u64, Vec<u8>)>> {
-        let mut out = Vec::new();
-
-        let records = self.filesystem_records();
-        let fs = btree::build(
-            &records,
-            XID,
-            14,
-            false,
-            None,
-            &mut once(OID_FS_ROOT, self.fs_tree),
-        )?;
-        let extentref = btree::build(
-            &[],
-            XID,
-            15,
-            true,
-            None,
-            &mut once(self.extentref, self.extentref),
-        )?;
-        let snapmeta = btree::build(
-            &[],
-            XID,
-            16,
-            true,
-            None,
-            &mut once(self.snapmeta, self.snapmeta),
-        )?;
-        let mappings: Vec<OwnedEntry> = fs
-            .mappings
-            .iter()
-            .map(|&(oid, block)| omap_entry(oid, block, XID))
-            .collect();
-        let vol_tree = btree::build(
-            &mappings,
-            XID,
-            11,
-            true,
-            Some((16, 16)),
-            &mut once(self.vol_tree, self.vol_tree),
-        )?;
-        let cont_tree = btree::build(
-            &[omap_entry(OID_VOLUME, self.apsb, XID)],
-            XID,
-            11,
-            true,
-            Some((16, 16)),
-            &mut once(self.cont_tree, self.cont_tree),
-        )?;
-        let fs_root = fs.root_oid;
-        let (extentref_oid, snapmeta_oid) = (extentref.root_oid, snapmeta.root_oid);
-        let vol_tree_root = vol_tree.root_block;
-        let cont_tree_root = cont_tree.root_block;
-        for tree in [fs, extentref, snapmeta, vol_tree, cont_tree] {
-            out.extend(tree.nodes);
-        }
-        out.push((self.vol_omap, omap(self.vol_omap, vol_tree_root, XID, 0)));
-        out.push((self.cont_omap, omap(self.cont_omap, cont_tree_root, XID, 1)));
-
-        // The volume's own blocks: its superblock, object map and four trees.
-        let volume_blocks = 6;
-        let mut volume = object(OID_VOLUME, XID, 13, 0);
-        volume[32..36].copy_from_slice(b"APSB");
-        let incompatible = if self.hashed {
-            INCOMPAT_NORMALIZATION_INSENSITIVE
-        } else {
-            0
-        };
-        w64(&mut volume, 56, incompatible);
-        w64(&mut volume, 88, volume_blocks);
-        w32(&mut volume, 116, 2);
-        w32(&mut volume, 120, OBJ_PHYSICAL | 2);
-        w32(&mut volume, 124, OBJ_PHYSICAL | 2);
-        w64(&mut volume, 128, self.vol_omap);
-        w64(&mut volume, 136, fs_root);
-        w64(&mut volume, 144, extentref_oid);
-        w64(&mut volume, 152, snapmeta_oid);
-        w64(&mut volume, 176, FIRST_USER_ID);
-        w64(&mut volume, 224, volume_blocks);
-        volume[240..256].copy_from_slice(&self.volume_uuid);
-        w64(&mut volume, 256, self.time_ns);
-        w64(&mut volume, 264, 1);
-        for at in [272, 320] {
-            volume[at..at + 6].copy_from_slice(b"hadris");
-            w64(&mut volume, at + 32, self.time_ns);
-            w64(&mut volume, at + 40, XID);
-        }
-        volume[704..704 + self.label.len()].copy_from_slice(&self.label);
-        w32(&mut volume, 960, 3);
-        seal(&mut volume);
-        out.push((self.apsb, volume));
+    /// Every block except the bitmaps, the container superblock, file data and
+    /// the zeroed rest of the checkpoint areas. It hands over the trees the plan
+    /// built, so it can be called once.
+    pub(crate) fn blocks(&mut self) -> Result<Vec<(u64, Vec<u8>)>> {
+        let mut out = core::mem::take(&mut self.metadata);
 
         for index in 0..self.cib_count {
             let first = index * CHUNKS_PER_CIB;
@@ -585,7 +584,7 @@ mod tests {
 
     #[test]
     fn emitted_blocks_tile_exactly_the_used_prefix() {
-        let plan = plan(4096);
+        let mut plan = plan(4096);
         let blocks = plan.blocks().unwrap();
         assert!(blocks.iter().all(|(_, bytes)| bytes.len() == BLOCK));
         let mut emitted: Vec<u64> = blocks.iter().map(|(block, _)| *block).collect();

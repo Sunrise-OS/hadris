@@ -23,6 +23,7 @@ mod sync {
     use super::*;
     use crate::common::BLOCK;
     use crate::common::write as fixture;
+    use hadris_apfs::ApfsNode;
     use hadris_apfs::sync::{ApfsFs, format};
     use hadris_fs::{DirCursor, ErrorKind, MountOptions, Name, SetAttr};
     use hadris_storage::sync::BlockDevice;
@@ -246,6 +247,188 @@ mod sync {
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 8 << 20);
         let mut fs = ApfsFs::mount(FileDevice::open(&path).unwrap(), MountOptions::new()).unwrap();
         assert!(names(&mut fs).is_empty());
+    }
+
+    fn read_all(fs: &mut ApfsFs<MemDevice<Vec<u8>>>, path: &[&str]) -> Vec<u8> {
+        let mut node = fs.root();
+        for part in path {
+            node = fs.lookup(node, Name::new(part)).unwrap();
+        }
+        let size = fs.stat(node).unwrap().len() as usize;
+        let mut out = vec![0; size];
+        assert_eq!(fs.read(node, 0, &mut out).unwrap(), size);
+        out
+    }
+
+    fn populated() -> ApfsNode {
+        let mut docs = ApfsNode::directory();
+        for (index, len) in [0, 1, BLOCK, BLOCK + 1, BLOCK * 9 + 77]
+            .into_iter()
+            .enumerate()
+        {
+            docs.add(&format!("f{index}"), ApfsNode::file(pattern(len)))
+                .unwrap();
+        }
+        let mut root = ApfsNode::directory().with_mode(0o750).with_owner(501, 20);
+        root.add("docs", docs).unwrap();
+        root.add("link", ApfsNode::symlink("docs/f1")).unwrap();
+        let mut many = ApfsNode::directory();
+        for index in 0..700 {
+            many.add(
+                &format!("n{index:04}"),
+                ApfsNode::file(vec![index as u8; 3]),
+            )
+            .unwrap();
+        }
+        root.add("many", many).unwrap();
+        root
+    }
+
+    #[test]
+    fn a_populated_container_reads_back_in_both_key_layouts() {
+        for insensitive in [true, false] {
+            let mut dev = blank(4096);
+            let options = ApfsOptions::new()
+                .with_normalization_insensitive(insensitive)
+                .with_root(populated());
+            format(&mut dev, &options).unwrap();
+            let mut fs = ApfsFs::mount(dev, MountOptions::new()).unwrap();
+            for (index, len) in [0, 1, BLOCK, BLOCK + 1, BLOCK * 9 + 77]
+                .into_iter()
+                .enumerate()
+            {
+                let name = format!("f{index}");
+                assert!(
+                    read_all(&mut fs, &["docs", &name]) == pattern(len),
+                    "{name}"
+                );
+            }
+            assert_eq!(
+                read_all(&mut fs, &["many", "n0699"]),
+                vec![699_u32 as u8; 3]
+            );
+            let link = fs.lookup(fs.root(), Name::new("link")).unwrap();
+            let mut target = [0; 32];
+            assert_eq!(fs.readlink(link, &mut target).unwrap(), b"docs/f1");
+            let root = fs.root();
+            assert_eq!(fs.stat(root).unwrap().permissions().bits(), 0o750);
+            let mut seen = names(&mut fs);
+            seen.sort();
+            assert_eq!(
+                seen,
+                vec![b"docs".to_vec(), b"link".to_vec(), b"many".to_vec()]
+            );
+        }
+    }
+
+    #[test]
+    fn a_populated_container_passes_the_writers_validation_and_takes_writes() {
+        for insensitive in [true, false] {
+            let mut dev = blank(4096);
+            let options = ApfsOptions::new()
+                .with_normalization_insensitive(insensitive)
+                .with_root(populated());
+            format(&mut dev, &options).unwrap();
+            let mut fs = ApfsFs::mount_writable(dev, MountOptions::new()).unwrap();
+            let root = fs.root();
+            let docs = fs.lookup(root, Name::new("docs")).unwrap();
+            let big = fs.lookup(docs, Name::new("f4")).unwrap();
+            fs.write(big, 5, b"patched").unwrap();
+            let fresh = fs
+                .create(root, Name::new("fresh"), &SetAttr::new())
+                .unwrap();
+            fs.write(fresh, 0, b"new").unwrap();
+            fs.unlink(docs, Name::new("f2")).unwrap();
+            fs.sync().unwrap();
+
+            let mut fs = ApfsFs::mount(fs.into_inner(), MountOptions::new()).unwrap();
+            let mut expected = pattern(BLOCK * 9 + 77);
+            expected[5..12].copy_from_slice(b"patched");
+            assert!(read_all(&mut fs, &["docs", "f4"]) == expected);
+            assert_eq!(read_all(&mut fs, &["fresh"]), b"new");
+            assert_eq!(
+                fs.lookup(docs, Name::new("f2")).unwrap_err().kind(),
+                ErrorKind::NotFound
+            );
+        }
+    }
+
+    #[test]
+    fn file_data_may_cover_the_blocks_numbered_like_the_ephemeral_objects() {
+        let payload = pattern(6 << 20);
+        let mut root = ApfsNode::directory();
+        root.add("big", ApfsNode::file(payload.clone())).unwrap();
+        let mut dev = device(vec![0; 16 << 20], 4096);
+        format(&mut dev, &ApfsOptions::new().with_root(root)).unwrap();
+        let mut fs = ApfsFs::mount_writable(dev, MountOptions::new()).unwrap();
+        let created = fs
+            .create(fs.root(), Name::new("x"), &SetAttr::new())
+            .unwrap();
+        fs.write(created, 0, b"x").unwrap();
+        let mut fs = ApfsFs::mount(fs.into_inner(), MountOptions::new()).unwrap();
+        assert!(read_all(&mut fs, &["big"]) == payload);
+    }
+
+    #[test]
+    fn a_tree_that_does_not_fit_or_is_invalid_fails_before_writing() {
+        let untouched = vec![0xa5; SIZE];
+        let mut full = ApfsNode::directory();
+        full.add("huge", ApfsNode::file(vec![1; SIZE])).unwrap();
+        let mut twice = ApfsNode::directory();
+        twice.add("\u{e9}", ApfsNode::directory()).unwrap();
+        twice.add("e\u{301}", ApfsNode::directory()).unwrap();
+        let mut empty_link = ApfsNode::directory();
+        empty_link.add("l", ApfsNode::symlink("")).unwrap();
+        let cases = [
+            (ApfsOptions::new().with_root(full), ErrorKind::NoSpace),
+            (
+                ApfsOptions::new().with_root(twice),
+                ErrorKind::AlreadyExists,
+            ),
+            (
+                ApfsOptions::new().with_root(empty_link),
+                ErrorKind::InvalidInput,
+            ),
+            (
+                ApfsOptions::new().with_root(ApfsNode::file(b"")),
+                ErrorKind::InvalidInput,
+            ),
+        ];
+        for (options, kind) in cases {
+            let mut dev = device(untouched.clone(), 4096);
+            assert_eq!(format(&mut dev, &options).unwrap_err().kind(), kind);
+            assert!(dev.into_inner() == untouched);
+        }
+        let mut twice = ApfsNode::directory();
+        twice.add("\u{e9}", ApfsNode::directory()).unwrap();
+        twice.add("e\u{301}", ApfsNode::directory()).unwrap();
+        let mut dev = blank(4096);
+        let plain = ApfsOptions::new().with_normalization_insensitive(false);
+        format(&mut dev, &plain.with_root(twice)).unwrap();
+    }
+
+    #[test]
+    fn node_names_are_checked_when_added() {
+        let mut dir = ApfsNode::directory();
+        for name in ["", ".", "..", "a/b", "a\0b"] {
+            assert_eq!(
+                dir.add(name, ApfsNode::directory()),
+                Err(ErrorKind::InvalidInput)
+            );
+        }
+        assert_eq!(
+            dir.add(&"x".repeat(256), ApfsNode::directory()),
+            Err(ErrorKind::NameTooLong)
+        );
+        dir.add("a", ApfsNode::directory()).unwrap();
+        assert_eq!(
+            dir.add("a", ApfsNode::directory()),
+            Err(ErrorKind::AlreadyExists)
+        );
+        assert_eq!(
+            ApfsNode::file(b"").add("a", ApfsNode::directory()),
+            Err(ErrorKind::NotADirectory)
+        );
     }
 }
 

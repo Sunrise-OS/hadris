@@ -5,7 +5,7 @@ use alloc::{collections::BTreeSet, vec, vec::Vec};
 use crate::types::{ContainerSuperblock, VolumeSuperblock, ObjectMapBlock, ObjectMapValue, OwnedEntry, VirtualObjectMap, FileExtentRecord};
 use crate::types::{le_u32,le_u64};
 use crate::types::checksum::verify_object;
-use crate::write::{self, Allocation, AllocationChunk, Records, WriteOperation, BLOCK, entry,key,object,omap,omap_entry,seal,w32,w64,unsupported};
+use crate::write::{self, Allocation, AllocationChunk, Records, WriteOperation, BLOCK, extent_ref,object,omap,omap_entry,seal,w32,w64,unsupported};
 use hadris_fs::{Error,ErrorKind,FsResult};
 use hadris_storage::BlockIndex;
 
@@ -15,7 +15,7 @@ struct State {
     extents:Vec<FileExtentRecord>, desc_index:u32, data_index:u32,
 }
 fn write_error<E>(e:crate::ApfsError)->Error<E>{match e {crate::ApfsError::InvalidValue("APFS write space exhausted")=>Error::new(ErrorKind::NoSpace,"APFS write space exhausted (old allocations are retained)"),other=>other.into()}}
-fn extent_entries(extents:&[FileExtentRecord])->Vec<OwnedEntry>{let mut result=Vec::with_capacity(extents.len());for e in extents{let mut v=vec![0;20];w64(&mut v,0,(e.length/BLOCK as u64)|(1<<60));w64(&mut v,8,e.id);w32(&mut v,16,1);result.push(entry(key(e.physical_block,1),v));}result.sort_by_key(|e|le_u64(&e.key,0).unwrap_or(0)&0x0fff_ffff_ffff_ffff);result}
+fn extent_entries(extents:&[FileExtentRecord])->Vec<OwnedEntry>{let mut result:Vec<_>=extents.iter().map(|e|extent_ref(e.physical_block,e.length/BLOCK as u64,e.id)).collect();result.sort_by_key(|e|le_u64(&e.key,0).unwrap_or(0)&0x0fff_ffff_ffff_ffff);result}
 fn free_ring_pair<E>(count:u32,start:u32,len:u32,next:u32)->FsResult<u32,E>{
     if count<4 || start>=count || len==0 || len>count-2 || next>=count{return Err(unsupported("APFS checkpoint ring geometry for writes"));}
     for step in 0..count{let candidate=(u64::from(next)+u64::from(step))%u64::from(count);let c=candidate as u32;let busy=|idx:u32|(u64::from(idx)+u64::from(count)-u64::from(start))%u64::from(count)<u64::from(len);if !busy(c)&&!busy((c+1)%count){return Ok(c);}}

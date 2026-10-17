@@ -74,7 +74,7 @@ pub async fn format<D: BlockDevice>(dev: &mut D, options: &ApfsOptions) -> FsRes
             size
         }
     };
-    let plan = Plan::new(options, size)?;
+    let mut plan = Plan::new(options, size)?;
     let blocks = plan.blocks()?;
 
     let zeros = vec![0_u8; ZERO_RUN * BLOCK];
@@ -86,6 +86,17 @@ pub async fn format<D: BlockDevice>(dev: &mut D, options: &ApfsOptions) -> FsRes
     zero(dev, &zeros, areas.start, areas.end - areas.start).await?;
     for (block, data) in &blocks {
         put(dev, *block, data).await?;
+    }
+    for (block, bytes) in plan.data(options) {
+        let whole = bytes.len() / BLOCK * BLOCK;
+        if whole > 0 {
+            put(dev, block, &bytes[..whole]).await?;
+        }
+        if whole < bytes.len() {
+            let mut tail = vec![0_u8; BLOCK];
+            tail[..bytes.len() - whole].copy_from_slice(&bytes[whole..]);
+            put(dev, block + (whole / BLOCK) as u64, &tail).await?;
+        }
     }
     let live = plan.used_chunks();
     for chunk in 0..live {

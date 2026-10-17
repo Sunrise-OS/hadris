@@ -12,6 +12,7 @@ use hadris_fs::{Error, ErrorKind, FsResult, SetAttr};
 
 pub(crate) mod btree;
 pub(crate) mod mkfs;
+pub(crate) mod tree;
 pub(crate) const BLOCK: usize = 4096;
 
 pub(crate) enum WriteOperation<'a> {
@@ -82,6 +83,13 @@ pub(crate) fn omap_entry(oid: u64, block: u64, xid: u64) -> OwnedEntry {
     w32(&mut v, 4, BLOCK as u32);
     w64(&mut v, 8, block);
     entry(k, v)
+}
+pub(crate) fn extent_ref(block: u64, count: u64, owner: u64) -> OwnedEntry {
+    let mut v = vec![0; 20];
+    w64(&mut v, 0, count | (1 << 60));
+    w64(&mut v, 8, owner);
+    w32(&mut v, 16, 1);
+    entry(key(block, 1), v)
 }
 pub(crate) fn omap(block: u64, root: u64, xid: u64, flags: u32) -> Vec<u8> {
     let mut b = object(block, xid, 0x4000_000b, 0);

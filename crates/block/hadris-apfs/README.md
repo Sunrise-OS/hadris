@@ -175,6 +175,25 @@ leaves a device that does not mount, or, when its first write fails, the
 untouched old container, and never a mix of the two. Nothing is written when
 an option or the device is invalid.
 
+To fill the volume at format time, build an `ApfsNode` tree and pass it to
+`ApfsOptions::with_root`. Directories, regular files and symbolic links are
+supported, each with its permission bits and owner; names are checked as they
+are added and a file's bytes are held in memory until written.
+
+```text
+let mut root = ApfsNode::directory();
+root.add("hello.txt", ApfsNode::file(b"hello\n".to_vec()))?;
+root.add("latest", ApfsNode::symlink("hello.txt"))?;
+format(&mut device, &ApfsOptions::new().with_root(root))?;
+```
+
+The container is built in one pass like `mkapfs` does: each file in one
+contiguous extent, then the trees. Nothing is written when the tree does not
+fit (`NoSpace`), a directory holds two names the volume compares equal
+(`AlreadyExists`) or a symbolic link target is empty, over 1024 bytes or holds
+a NUL (`InvalidInput`). Such a container is not limited by the mutation
+budget below and stays writable through `mount_writable`.
+
 A new container has a small budget of mutations, because the writable driver
 never reclaims blocks and rebuilds the filesystem tree and the allocation
 bitmaps on every change. Creating empty files one at a time on a fresh volume
