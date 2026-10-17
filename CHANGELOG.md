@@ -27,10 +27,13 @@ Each published package owns its version and may be released independently.
   after about 20 in 1 MiB, 270 in 16 MiB and 1,600 in 256 MiB.
 
 - **hadris-apfs:** `ApfsOptions::with_root` takes an `ApfsNode` tree of
-  directories, regular files and symbolic links (modes, owners, names
-  checked as they are added) and `format` writes it in one pass, the way
+  directories, regular files and symbolic links (modes, owners, BSD flags and
+  names checked as they are added) and `format` writes it in one pass, the way
   `mkapfs` does: file data first, each file in one contiguous extent, then the
-  bookkeeping and the trees. A populated container is not subject to the
+  bookkeeping and the trees. A file built with `ApfsNode::file_from` takes a
+  `FileSource` and is read as the format writes it, so a large tree need not
+  fit in memory; `file` keeps the bytes in memory as before. A populated
+  container is not subject to the
   small mutation budget of an empty one, can be filled to capacity, fails with
   `NoSpace` before writing when the tree does not fit, and stays writable
   through `mount_writable`. It was compared against the source tree through

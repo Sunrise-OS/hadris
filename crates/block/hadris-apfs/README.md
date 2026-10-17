@@ -177,13 +177,23 @@ an option or the device is invalid.
 
 To fill the volume at format time, build an `ApfsNode` tree and pass it to
 `ApfsOptions::with_root`. Directories, regular files and symbolic links are
-supported, each with its permission bits and owner; names are checked as they
-are added and a file's bytes are held in memory until written.
+supported, each with its permission bits, owner and BSD flags (`st_flags`);
+names are checked as they are added. A file built with `ApfsNode::file` holds
+its bytes in memory until written; one built with `ApfsNode::file_from` takes
+a `FileSource` and is read as the format writes it, so a large tree need not
+fit in memory.
 
 ```text
 let mut root = ApfsNode::directory();
 root.add("hello.txt", ApfsNode::file(b"hello\n".to_vec()))?;
 root.add("latest", ApfsNode::symlink("hello.txt"))?;
+root.add("big", ApfsNode::file_from(open_reader("big.bin")?))?;
+format(&mut device, &ApfsOptions::new().with_root(root))?;
+```
+
+```text
+let mut root = ApfsNode::directory().with_flags(SF_RESTRICTED);
+root.add("sealed", ApfsNode::directory().with_owner(0, 0))?;
 format(&mut device, &ApfsOptions::new().with_root(root))?;
 ```
 

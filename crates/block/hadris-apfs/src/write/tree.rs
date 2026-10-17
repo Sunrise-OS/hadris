@@ -2,6 +2,7 @@
 
 use alloc::collections::BTreeSet;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::convert::Infallible;
@@ -31,24 +32,79 @@ const XF_SYSTEM_FIELD: u8 = 0x20;
 const MAX_NAME: usize = 255;
 const MAX_SYMLINK: usize = 1024;
 
+/// A regular file's bytes, read on demand as the format writes them.
+///
+/// Implement this to pack a file without holding it in memory. The format
+/// reads a file from the start with [`read_at`](Self::read_at), which returns
+/// `0` only at or past [`len`](Self::len) and fails with [`ErrorKind::Io`]
+/// when the source cannot be read.
+pub trait FileSource: core::fmt::Debug {
+    /// The file's length in bytes.
+    fn len(&self) -> u64;
+
+    /// Whether the file is empty.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Reads into `buf` starting at `offset`, returning how many bytes were
+    /// read.
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, ErrorKind>;
+}
+
+/// A regular file's contents: bytes already in memory, or a source read as
+/// the format writes them.
+#[derive(Debug, Clone)]
+pub(crate) enum Content {
+    Bytes(Vec<u8>),
+    Source(Arc<dyn FileSource>),
+}
+
+impl Content {
+    pub(crate) fn len(&self) -> u64 {
+        match self {
+            Content::Bytes(data) => data.len() as u64,
+            Content::Source(source) => source.len(),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub(crate) fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, ErrorKind> {
+        match self {
+            Content::Bytes(data) => {
+                let start = (offset as usize).min(data.len());
+                let count = buf.len().min(data.len() - start);
+                buf[..count].copy_from_slice(&data[start..start + count]);
+                Ok(count)
+            }
+            Content::Source(source) => source.read_at(offset, buf),
+        }
+    }
+}
+
 /// A directory, regular file or symbolic link of a container being formatted.
 ///
-/// Build a tree with [`ApfsNode::directory`], [`ApfsNode::file`] and
-/// [`ApfsNode::symlink`], join nodes with [`ApfsNode::add`], and hand the
-/// root to `ApfsOptions::with_root`. A file's bytes are held in memory until
-/// the format has written them.
+/// Build a tree with [`ApfsNode::directory`], [`ApfsNode::file`],
+/// [`ApfsNode::file_from`] and [`ApfsNode::symlink`], join nodes with
+/// [`ApfsNode::add`], and hand the root to `ApfsOptions::with_root`. A file
+/// built with [`ApfsNode::file`] holds its bytes until the format has written
+/// them; one built with [`ApfsNode::file_from`] reads them as it goes.
 #[derive(Debug, Clone)]
 pub struct ApfsNode {
     pub(crate) kind: Kind,
     pub(crate) mode: u16,
     pub(crate) uid: u32,
     pub(crate) gid: u32,
+    pub(crate) flags: u32,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) enum Kind {
     Directory(Vec<(String, ApfsNode)>),
-    File(Vec<u8>),
+    File(Content),
     Symlink(String),
 }
 
@@ -59,6 +115,7 @@ impl ApfsNode {
             mode,
             uid: 0,
             gid: 0,
+            flags: 0,
         }
     }
 
@@ -70,7 +127,14 @@ impl ApfsNode {
     /// A regular file holding `data`, with mode `0o644`. An empty file has no
     /// data blocks.
     pub fn file(data: impl Into<Vec<u8>>) -> Self {
-        Self::new(Kind::File(data.into()), 0o644)
+        Self::new(Kind::File(Content::Bytes(data.into())), 0o644)
+    }
+
+    /// A regular file whose bytes are read from `source` as the format writes
+    /// them, with mode `0o644`. The file is `source.len()` bytes long, so the
+    /// tree never holds its contents.
+    pub fn file_from(source: impl FileSource + 'static) -> Self {
+        Self::new(Kind::File(Content::Source(Arc::new(source))), 0o644)
     }
 
     /// A symbolic link to `target`, with mode `0o755`. The target must be 1
@@ -89,6 +153,13 @@ impl ApfsNode {
     pub const fn with_owner(mut self, uid: u32, gid: u32) -> Self {
         self.uid = uid;
         self.gid = gid;
+        self
+    }
+
+    /// Sets the BSD file flags (`st_flags`), such as `SF_RESTRICTED`, for a
+    /// node whose volume seals it.
+    pub const fn with_flags(mut self, flags: u32) -> Self {
+        self.flags = flags;
         self
     }
 
@@ -140,7 +211,7 @@ impl Flat<'_> {
     /// The file's data length in bytes, or 0 for anything but a regular file.
     pub fn size(&self) -> u64 {
         match &self.node.kind {
-            Kind::File(data) => data.len() as u64,
+            Kind::File(content) => content.len(),
             _ => 0,
         }
     }
@@ -232,6 +303,7 @@ struct Inode<'a> {
     parent: u64,
     id: u64,
     flags: u64,
+    bsd_flags: u32,
     nlink: u32,
     mode: u16,
     uid: u32,
@@ -250,6 +322,7 @@ fn inode_value(inode: &Inode<'_>) -> Vec<u8> {
     }
     w64(&mut value, 48, inode.flags);
     w32(&mut value, 56, inode.nlink);
+    w32(&mut value, 68, inode.bsd_flags);
     w32(&mut value, 72, inode.uid);
     w32(&mut value, 76, inode.gid);
     w16(&mut value, 80, inode.mode);
@@ -326,6 +399,7 @@ pub(crate) fn records(flat: &[Flat<'_>], time: u64, hashed: bool) -> Built {
                 mode: S_IFDIR | 0o755,
                 uid: 0,
                 gid: 0,
+                bsd_flags: 0,
                 time,
                 name: Some("private-dir"),
                 stream: None,
@@ -340,6 +414,7 @@ pub(crate) fn records(flat: &[Flat<'_>], time: u64, hashed: bool) -> Built {
             parent: inode.parent,
             id: inode.id,
             flags: 0,
+            bsd_flags: node.flags,
             nlink: 1,
             mode: node.mode,
             uid: node.uid,
@@ -359,12 +434,12 @@ pub(crate) fn records(flat: &[Flat<'_>], time: u64, hashed: bool) -> Built {
                 spec.nlink = inode.children.len() as u32;
                 DT_DIR
             }
-            Kind::File(data) => {
+            Kind::File(_) => {
                 files += 1;
                 spec.mode |= S_IFREG;
-                if !data.is_empty() {
+                if inode.size() > 0 {
                     let allocated = inode.data_blocks() * BLOCK as u64;
-                    spec.stream = Some((data.len() as u64, allocated));
+                    spec.stream = Some((inode.size(), allocated));
                     fs.push(entry(key(inode.id, 6), 1u32.to_le_bytes().to_vec()));
                     let mut extent_key = key(inode.id, 8);
                     extent_key.extend_from_slice(&0u64.to_le_bytes());
@@ -418,15 +493,15 @@ pub(crate) fn records(flat: &[Flat<'_>], time: u64, hashed: bool) -> Built {
     }
 }
 
-/// The data of every nonempty file in the order `flatten` numbers them.
-pub(crate) fn file_data<'a>(node: &'a ApfsNode, out: &mut Vec<&'a [u8]>) {
+/// The contents of every nonempty file in the order `flatten` numbers them.
+pub(crate) fn file_data<'a>(node: &'a ApfsNode, out: &mut Vec<&'a Content>) {
     match &node.kind {
         Kind::Directory(children) => {
             for (_, child) in children {
                 file_data(child, out);
             }
         }
-        Kind::File(data) if !data.is_empty() => out.push(data),
+        Kind::File(content) if !content.is_empty() => out.push(content),
         Kind::File(_) | Kind::Symlink(_) => {}
     }
 }

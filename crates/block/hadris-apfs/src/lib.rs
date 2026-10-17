@@ -102,7 +102,7 @@ pub use error::{ApfsError, Detail, Result};
 #[cfg(all(feature = "write", any(feature = "sync", feature = "async")))]
 pub use write::mkfs::{ApfsOptions, Formatted};
 #[cfg(all(feature = "write", any(feature = "sync", feature = "async")))]
-pub use write::tree::ApfsNode;
+pub use write::tree::{ApfsNode, FileSource};
 
 /// Selects the volume to mount within an APFS container.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

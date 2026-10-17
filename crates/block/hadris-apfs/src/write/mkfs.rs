@@ -138,14 +138,18 @@ impl ApfsOptions {
 
     /// Fills the volume with the files, directories and symbolic links of
     /// `root`, which must be a directory and becomes the volume's root
-    /// directory, with its own mode and owner. The container is built in one
-    /// pass, with every file stored in a single contiguous extent, so it is
-    /// not subject to the small mutation budget of a container that is
+    /// directory, with its own mode, owner and flags. The container is built
+    /// in one pass, with every file stored in a single contiguous extent, so
+    /// it is not subject to the small mutation budget of a container that is
     /// written to afterwards, and it can be as full as the container allows.
+    /// A file built with [`ApfsNode::file_from`] is read from its source as
+    /// the format writes it, so the tree holds no file's bytes.
     /// A format fails with `NoSpace` when the tree does not fit,
     /// `InvalidInput` when the root is not a directory or a symbolic link
-    /// target is empty, over 1024 bytes or holds a NUL, and `AlreadyExists`
-    /// when a directory holds two names the volume compares equal.
+    /// target is empty, over 1024 bytes or holds a NUL, `Corrupt` or `Io`
+    /// when a source does not deliver the bytes it promised, and
+    /// `AlreadyExists` when a directory holds two names the volume compares
+    /// equal.
     pub fn with_root(mut self, root: ApfsNode) -> Self {
         self.root = Some(root);
         self
@@ -409,8 +413,8 @@ impl Plan {
         })
     }
 
-    /// Where each nonempty file's data goes, with the bytes, in tree order.
-    pub(crate) fn data<'a>(&self, options: &'a ApfsOptions) -> Vec<(u64, &'a [u8])> {
+    /// Where each nonempty file's data goes, with its contents, in tree order.
+    pub(crate) fn data<'a>(&self, options: &'a ApfsOptions) -> Vec<(u64, &'a tree::Content)> {
         let mut files = Vec::new();
         if let Some(root) = &options.root {
             tree::file_data(root, &mut files);

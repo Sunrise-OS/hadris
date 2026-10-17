@@ -2,6 +2,7 @@ io_transform! {
 use super::storage::BlockDevice;
 use crate::write::BLOCK;
 use crate::write::mkfs::{ApfsOptions, Formatted, Plan};
+use crate::write::tree::Content;
 use alloc::vec;
 use hadris_fs::{ErrorKind, FsResult};
 use hadris_storage::BlockIndex;
@@ -12,6 +13,22 @@ const ZERO_RUN: usize = 32;
 async fn put<D: BlockDevice>(dev: &mut D, block: u64, data: &[u8]) -> FsResult<(), D::Error> {
     let factor = BLOCK as u64 / u64::from(dev.block_size().get());
     dev.write_blocks(BlockIndex::new(block * factor), data).await
+}
+
+/// Fills `buf` from `content` at `offset`, which must hold that many more
+/// bytes.
+fn read_source<E>(content: &Content, mut offset: u64, buf: &mut [u8]) -> FsResult<(), E> {
+    let mut done = 0;
+    while done < buf.len() {
+        match content.read_at(offset, &mut buf[done..])? {
+            0 => return Err(ErrorKind::Corrupt.into()),
+            n => {
+                done += n;
+                offset += n as u64;
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn zero<D: BlockDevice>(dev: &mut D, zeros: &[u8], first: u64, count: u64) -> FsResult<(), D::Error> {
@@ -78,6 +95,7 @@ pub async fn format<D: BlockDevice>(dev: &mut D, options: &ApfsOptions) -> FsRes
     let blocks = plan.blocks()?;
 
     let zeros = vec![0_u8; ZERO_RUN * BLOCK];
+    let mut scratch = vec![0_u8; ZERO_RUN * BLOCK];
     if device_bytes < size {
         zero(dev, &zeros, plan.last_block(), 1).await?;
     }
@@ -87,15 +105,24 @@ pub async fn format<D: BlockDevice>(dev: &mut D, options: &ApfsOptions) -> FsRes
     for (block, data) in &blocks {
         put(dev, *block, data).await?;
     }
-    for (block, bytes) in plan.data(options) {
-        let whole = bytes.len() / BLOCK * BLOCK;
-        if whole > 0 {
-            put(dev, block, &bytes[..whole]).await?;
-        }
-        if whole < bytes.len() {
-            let mut tail = vec![0_u8; BLOCK];
-            tail[..bytes.len() - whole].copy_from_slice(&bytes[whole..]);
-            put(dev, block + (whole / BLOCK) as u64, &tail).await?;
+    for (block, content) in plan.data(options) {
+        let len = content.len();
+        let mut at = block;
+        let mut offset = 0;
+        while offset < len {
+            let want = ((len - offset) as usize).min(scratch.len());
+            read_source(content, offset, &mut scratch[..want])?;
+            let whole = want / BLOCK * BLOCK;
+            if whole > 0 {
+                put(dev, at, &scratch[..whole]).await?;
+            }
+            if whole < want {
+                let tail = whole + BLOCK;
+                scratch[want..tail].fill(0);
+                put(dev, at + (whole / BLOCK) as u64, &scratch[whole..tail]).await?;
+            }
+            offset += want as u64;
+            at += want.div_ceil(BLOCK) as u64;
         }
     }
     let live = plan.used_chunks();

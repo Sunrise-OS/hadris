@@ -249,6 +249,93 @@ mod sync {
         assert!(names(&mut fs).is_empty());
     }
 
+    /// A source that hands out its bytes in small pieces.
+    #[derive(Debug)]
+    struct Paced {
+        data: Vec<u8>,
+        step: usize,
+    }
+
+    impl hadris_apfs::FileSource for Paced {
+        fn len(&self) -> u64 {
+            self.data.len() as u64
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, ErrorKind> {
+            let start = (offset as usize).min(self.data.len());
+            let count = buf.len().min(self.data.len() - start).min(self.step);
+            buf[..count].copy_from_slice(&self.data[start..start + count]);
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn a_source_backed_file_streams_back_its_bytes() {
+        let payload = pattern(BLOCK * 3 + 777);
+        let mut root = ApfsNode::directory();
+        root.add(
+            "big",
+            ApfsNode::file_from(Paced {
+                data: payload.clone(),
+                step: 1000,
+            }),
+        )
+        .unwrap();
+        root.add("small", ApfsNode::file(b"hi")).unwrap();
+        let mut dev = blank(4096);
+        format(&mut dev, &ApfsOptions::new().with_root(root)).unwrap();
+        let mut fs = ApfsFs::mount(dev, MountOptions::new()).unwrap();
+        assert!(read_all(&mut fs, &["big"]) == payload);
+        assert_eq!(read_all(&mut fs, &["small"]), b"hi");
+    }
+
+    #[test]
+    fn a_source_that_ends_early_fails_the_format() {
+        #[derive(Debug)]
+        struct Short;
+        impl hadris_apfs::FileSource for Short {
+            fn len(&self) -> u64 {
+                4096
+            }
+            fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, ErrorKind> {
+                let count = buf.len().min((1024_u64.saturating_sub(offset)) as usize);
+                Ok(count)
+            }
+        }
+        let mut root = ApfsNode::directory();
+        root.add("short", ApfsNode::file_from(Short)).unwrap();
+        let mut dev = blank(4096);
+        assert_eq!(
+            format(&mut dev, &ApfsOptions::new().with_root(root))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Corrupt
+        );
+    }
+
+    #[test]
+    fn inode_bsd_flags_are_stored() {
+        let mut root = ApfsNode::directory().with_flags(0x8000_0000);
+        root.add(
+            "keep",
+            ApfsNode::directory().with_flags(0x20).with_owner(7, 8),
+        )
+        .unwrap();
+        let mut dev = blank(4096);
+        format(&mut dev, &ApfsOptions::new().with_root(root)).unwrap();
+        let mut fs = ApfsFs::mount(dev, MountOptions::new()).unwrap();
+        let keep = fs.lookup(fs.root(), Name::new("keep")).unwrap();
+        let device = fs.into_inner();
+        let mut container = hadris_apfs::sync::Container::open(device).unwrap();
+        let checkpoint = container.latest_superblock().unwrap();
+        let volume = container.volume_superblocks(&checkpoint).unwrap().remove(0);
+        let mut inode = |id| container.inode_record(&volume, id).unwrap().unwrap();
+        assert_eq!(inode(2).bsd_flags, 0x8000_0000);
+        assert_eq!(inode(keep.get()).bsd_flags, 0x20);
+        assert_eq!(inode(keep.get()).owner, 7);
+        assert_eq!(inode(keep.get()).group, 8);
+    }
+
     fn read_all(fs: &mut ApfsFs<MemDevice<Vec<u8>>>, path: &[&str]) -> Vec<u8> {
         let mut node = fs.root();
         for part in path {
